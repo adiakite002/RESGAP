@@ -83,6 +83,18 @@ output <- s3read_using(
 )
 ```
 
+```{r}
+library(readxl)
+
+forest_area <- s3read_using(
+  FUN    = readxl::read_excel,
+  object = "s3://projet-esteem/EXIOBASE/forestarea27.xlsx",
+  bucket = "projet-esteem",
+  opts   = list("region" = "")
+)
+```
+
+
 ```{r apercu-donnees}
 # aperçu général des structures
 glimpse(final_demand)
@@ -114,6 +126,14 @@ s3write_using(
 s3write_using(
   FUN    = saveRDS,
   x      = output,
+  object = "s3://projet-esteem/EXIOBASE/projesgap2.rds",
+  bucket = "projet-esteem",
+  opts   = list("region" = "")
+)
+
+s3write_using(
+  FUN    = saveRDS,
+  x      = forest_area,
   object = "s3://projet-esteem/EXIOBASE/projesgap2.rds",
   bucket = "projet-esteem",
   opts   = list("region" = "")
@@ -1341,6 +1361,13 @@ ggplot(contribution_long,
   theme_minimal(base_size = 11) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1),
         legend.position = "bottom")
+
+ggsave(
+  filename = "Contribution des deux sources d'extraction.png",
+  width = 10,
+  height = 5,
+  dpi = 300
+)
 ```
 
 # Section 3 — Agrégation : extraction forestière totale
@@ -1467,8 +1494,249 @@ ggplot(heatmap_totale, aes(x = annee, y = pays, fill = extraction_totale / 1e6))
     panel.grid      = element_blank(),
     legend.position = "right"
   )
+
+ggsave(
+  filename = "Évolution de l'extraction forestière totale par pays (1995-2022).png",
+  width = 10,
+  height = 5,
+  dpi = 300
+)
+
 ```
 ```{r}
 unique(intermediate$pays)
 ```
 
+# =============================================================================
+# Section 5 — Récupération de la surface forestière (Banque mondiale)
+#
+# Source : Banque mondiale, indicateur AG.LND.FRST.K2 (Forest area, sq. km)
+# Données originalement issues de FAOSTAT
+# Fichier : forestarea.xlsx, format LARGE (wide)
+# Période : 1995-2022, unité km²
+# =============================================================================
+
+## 5.1 — Lecture du fichier brut
+
+```{r lecture-bm}
+library(readxl)
+library(tidyr)
+
+# aperçu de la structure originale
+glimpse(forest_area)
+```
+
+## 5.2 — Passage en format long
+
+## 5.2 — Passage en format long (version corrigée)
+
+```{r pivot-long}
+# le fichier mélange des colonnes texte (1995-1999 contiennent "..") 
+# et des colonnes numériques (2000-2022). 
+# on les convertit toutes en caractères avant le pivot, puis en numérique après
+
+forest_area_long <- forest_area %>%
+  # on garde uniquement les colonnes utiles (pays + années)
+  select(`Country Name`, `Country Code`, starts_with("19"), starts_with("20")) %>%
+  # on convertit toutes les colonnes années en caractères pour homogénéiser les types
+  mutate(across(-c(`Country Name`, `Country Code`), as.character)) %>%
+  # pivot long : chaque ligne = pays x année
+  pivot_longer(
+    cols      = -c(`Country Name`, `Country Code`),
+    names_to  = "annee",
+    values_to = "surface_km2"
+  ) %>%
+  mutate(
+    # extraction de l'année du format "1995 [YR1995]"
+    annee = as.integer(substr(annee, 1, 4)),
+    # les valeurs manquantes sont codées ".." dans le fichier BM
+    # on les met en NA puis on convertit en numérique
+    surface_km2 = ifelse(surface_km2 == "..", NA_real_, surface_km2),
+    surface_km2 = as.numeric(surface_km2)
+  ) %>%
+  # renommage pour cohérence avec notre nomenclature
+  rename(
+    pays_nom  = `Country Name`,
+    pays_iso3 = `Country Code`
+  )
+
+# vérifications
+glimpse(forest_area_long)
+cat("Nombre total de lignes :", nrow(forest_area_long), "\n")
+cat("Pays uniques (ISO3)    :", n_distinct(forest_area_long$pays_iso3), "\n")
+cat("Années couvertes       :", paste(range(forest_area_long$annee), collapse = " - "), "\n")
+cat("Valeurs manquantes (NA):", sum(is.na(forest_area_long$surface_km2)), "\n")
+```
+
+## 5.3 — Conversion ISO3 vers ISO2
+
+Nos données EXIOBASE utilisent les codes ISO2 (AT, BE...) alors que la BM utilise ISO3 (AUT, BEL...). On harmonise.
+
+```{r conversion-iso}
+# table de correspondance ISO3 -> ISO2 pour les pays ESGAP
+table_iso <- data.frame(
+  pays_iso3 = c("AUT","BEL","BGR","HRV","CYP","CZE","DNK","EST","FIN","FRA",
+                "DEU","GRC","HUN","IRL","ITA","LVA","LTU","LUX","NLD","POL",
+                "PRT","ROU","SVK","SVN","ESP","SWE","GBR"),
+  pays      = c("AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR",
+                "DE","GR","HU","IE","IT","LV","LT","LU","NL","PL",
+                "PT","RO","SK","SI","ES","SE","GB"),
+  stringsAsFactors = FALSE
+)
+
+# jointure pour ajouter le code ISO2
+forest_area_long <- forest_area_long %>%
+  left_join(table_iso, by = "pays_iso3")
+
+# diagnostic : quels pays n'ont pas de correspondance ?
+# (ce sont les pays hors ESGAP : Suisse, Moldavie)
+forest_area_long %>%
+  filter(is.na(pays)) %>%
+  distinct(pays_iso3, pays_nom)
+```
+
+## 5.4 — Filtrage sur les 27 pays Ind. 01
+
+```{r filtre-pays-esgap}
+# liste des 27 pays ESGAP couverts par notre analyse Ind. 01
+pays_ind01 <- unique(pressions_2stressors$pays)
+
+# filtrage : on garde uniquement les pays présents dans nos données EXIOBASE
+# cela exclut automatiquement la Suisse (CHE) et la Moldavie (MDA)
+forest_area_ind01 <- forest_area_long %>%
+  filter(pays %in% pays_ind01) %>%
+  select(pays, pays_iso3, pays_nom, annee, surface_km2)
+
+# vérifications
+cat("Pays couverts après filtrage :", n_distinct(forest_area_ind01$pays), "\n")
+cat("Pays attendus (Ind. 01)      :", length(pays_ind01), "\n")
+
+# y a-t-il un pays Ind. 01 absent du fichier BM ?
+pays_manquants <- setdiff(pays_ind01, unique(forest_area_ind01$pays))
+if (length(pays_manquants) > 0) {
+  cat("ATTENTION - pays Ind. 01 absent du fichier BM :", pays_manquants, "\n")
+} else {
+  cat("OK - tous les pays Ind. 01 sont couverts par le fichier BM\n")
+}
+```
+
+## 5.5 — Diagnostic des valeurs manquantes
+
+Les valeurs manquantes (".." dans le fichier BM) ont été converties en NA. On vérifie où elles se trouvent.
+
+```{r diagnostic-na}
+# nombre de NA par pays
+na_par_pays <- forest_area_ind01 %>%
+  group_by(pays, pays_nom) %>%
+  summarise(
+    n_total      = n(),
+    n_manquantes = sum(is.na(surface_km2)),
+    annees_manquantes = paste(annee[is.na(surface_km2)], collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  filter(n_manquantes > 0)
+
+print(na_par_pays)
+```
+
+## 5.6 — Imputation des valeurs manquantes
+
+Pour les pays avec des trous (BE et LU sur les premières années), on impute par **report de la valeur la plus proche disponible**. C'est une stratégie conservative on suppose que la surface forestière n'a pas changé brutalement entre les années manquantes et la première année disponible.
+
+```{r imputation}
+# imputation par "report arrière" (na.locf inversé) puis "report avant"
+# si une année est NA, on lui attribue la valeur de l'année suivante disponible
+library(zoo)
+
+forest_area_ind01 <- forest_area_ind01 %>%
+  group_by(pays) %>%
+  arrange(annee) %>%
+  mutate(
+    # d'abord report arrière (les NA initiaux prennent la valeur de la 1ère année dispo)
+    surface_km2 = na.locf(surface_km2, fromLast = TRUE, na.rm = FALSE),
+    # puis report avant au cas où (sécurité)
+    surface_km2 = na.locf(surface_km2, na.rm = FALSE)
+  ) %>%
+  ungroup()
+
+# vérification : plus de NA ?
+cat("NA restants après imputation :", sum(is.na(forest_area_ind01$surface_km2)), "\n")
+```
+
+## 5.7 — Statistiques descriptives sur la surface forestière
+
+```{r stats-surface}
+stats_surface <- forest_area_ind01 %>%
+  group_by(pays, pays_nom) %>%
+  summarise(
+    surface_moyenne = mean(surface_km2, na.rm = TRUE),
+    surface_min     = min(surface_km2,  na.rm = TRUE),
+    surface_max     = max(surface_km2,  na.rm = TRUE),
+    evolution_pct   = round(100 * (max(surface_km2) - min(surface_km2)) / min(surface_km2), 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(surface_moyenne))
+
+print(stats_surface, n = 30)
+```
+# =============================================================================
+# Section 6 — Calcul de l'intensité biophysique
+#
+# Intensité biophysique = extraction totale (t) / surface forestière (km²)
+# Unité : tonnes de bois extraites par km² de forêt
+# 
+# Cette métrique est un proxy du Forest utilization rate d'Arkaitz.
+# Elle reste dans le cadre de la soutenabilité forte (rapport biophysique pur)
+# contrairement à l'intensité économique (rapport pression/output €).
+# =============================================================================
+
+## 6.1 — Jointure des données EXIOBASE avec la surface forestière
+
+```{r jointure-extraction-surface}
+# on prépare la table d'extraction totale par pays x année
+# en gardant les unités : 
+#   - extraction_totale en kt (milliers de tonnes) -> on multiplie par 1000 pour avoir des tonnes
+#   - surface_km2 en km²
+extraction_avec_surface <- pressions_2stressors %>%
+  select(pays, annee, extraction_totale) %>%
+  inner_join(
+    forest_area_ind01 %>% select(pays, annee, surface_km2),
+    by = c("pays", "annee")
+  ) %>%
+  mutate(
+    # extraction_totale est en kt (= 1000 tonnes), on convertit en tonnes
+    extraction_tonnes = extraction_totale * 1000,
+    # intensité biophysique en tonnes par km²
+    intensite_exploitforestiere = extraction_tonnes / surface_km2
+  )
+
+# vérifications
+cat("Nombre de lignes après jointure :", nrow(extraction_avec_surface), "\n")
+cat("Pays couverts                   :", n_distinct(extraction_avec_surface$pays), "\n")
+cat("Années couvertes                :", paste(range(extraction_avec_surface$annee), collapse = " - "), "\n")
+cat("NA en intensité biophysique     :", sum(is.na(extraction_avec_surface$intensite_exploitforestiere)), "\n\n")
+
+# distribution de l'intensité biophysique
+summary(extraction_avec_surface$intensite_exploitforestiere)
+```
+
+## 6.2 — Statistiques descriptives par pays
+
+```{r stats-intensite-biophysique}
+stats_intensite <- extraction_avec_surface %>%
+  group_by(pays) %>%
+  summarise(
+    intensite_moyenne = mean(intensite_exploitforestiere, na.rm = TRUE),
+    intensite_min     = min(intensite_exploitforestiere,  na.rm = TRUE),
+    intensite_max     = max(intensite_exploitforestiere,  na.rm = TRUE),
+    extraction_moyenne_kt = mean(extraction_totale,  na.rm = TRUE),
+    surface_moyenne_km2   = mean(surface_km2,        na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(intensite_moyenne)) %>%
+  mutate(rang = row_number()) %>%
+  select(rang, pays, extraction_moyenne_kt, surface_moyenne_km2,
+         intensite_moyenne, intensite_min, intensite_max)
+
+print(stats_intensite, n = 30)
+```
