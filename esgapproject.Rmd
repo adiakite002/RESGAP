@@ -1427,6 +1427,13 @@ ggplot(evolution_europe_totale,
   ) +
   theme_minimal(base_size = 11) +
   theme(legend.position = "bottom")
+
+ggsave(
+  filename = "evolution_extraction_forestiere_europe.png",
+  width = 10,
+  height = 5,
+  dpi = 300
+)
 ```
 
 ## Heatmap pays × année — extraction totale
@@ -1461,3 +1468,7 @@ ggplot(heatmap_totale, aes(x = annee, y = pays, fill = extraction_totale / 1e6))
     legend.position = "right"
   )
 ```
+```{r}
+unique(intermediate$pays)
+```
+
