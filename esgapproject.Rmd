@@ -1,5 +1,1463 @@
 ---
-title: "esgapproject"
-output: html_document
+title: "Mission 2 — Analyse de la capacité explicative des pressions EXIOBASE vis-à-vis des écarts aux standards ESGAP"
+author: "Abdoulaye Diakité — AFD ISR ECO, Équipe Biodiversité"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
 ---
 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  fig.align  = "center"
+)
+```
+
+# Contexte de la mission
+
+Cette analyse s'inscrit dans la Mission 2 du stage, dont la question de recherche est :
+
+> *Dans quelle mesure les pressions environnementales identifiées dans EXIOBASE permettent-elles d'expliquer les écarts aux standards de bon état environnemental mesurés par les indicateurs ESGAP ?*
+
+Les scores ESGAP ont été construits par Usubiaga-Liaño et Ekins (2021) à partir d'indicateurs d'**état** environnemental, tandis qu'EXIOBASE fournit des indicateurs de **pression** environnementale (émissions, consommations d'eau, occupation des sols, etc.). L'objectif n'est donc pas de reproduire ESGAP mais d'évaluer le pouvoir explicatif des pressions EXIOBASE vis-à-vis des écarts de performance environnementale observés dans ESGAP.
+
+**Tuteur** : Matthieu Trichet
+
+---
+
+# Chargement des données depuis SSPCloud
+
+Les données sont stockées dans le bucket `projet-esteem` sur SSPCloud. Trois fichiers parquet sont mobilisés :
+
+- `intermediate_ALL_EU_long.parquet` : pressions associées aux secteurs productifs
+- `final_demand_ALL_EU_long.parquet` : pressions associées à la demande finale
+- `output_long_ALL.parquet` : production économique par secteur
+
+Les données ont été préalablement filtrées par Matthieu sur les 28 pays européens présents dans ESGAP, et mises en format long pour faciliter les traitements.
+
+```{r packages}
+library(aws.s3)
+library(arrow)
+library(dplyr)
+library(ggplot2)
+```
+
+```{r chargement-donnees}
+# pressions associées à la demande finale (ménages, gouvernement, etc.)
+final_demand <- s3read_using(
+  FUN    = arrow::read_parquet,
+  object = "EXIOBASE/v3.10.2/consolidated/final_demand_ALL_EU_long.parquet",
+  bucket = "projet-esteem",
+  opts   = list("region" = "")
+)
+
+# pressions associées aux secteurs productifs
+intermediate <- s3read_using(
+  FUN    = arrow::read_parquet,
+  object = "EXIOBASE/v3.10.2/consolidated/intermediate_ALL_EU_long.parquet",
+  bucket = "projet-esteem",
+  opts   = list("region" = "")
+)
+
+# output économique par secteur (sert de dénominateur aux intensités)
+output <- s3read_using(
+  FUN    = arrow::read_parquet,
+  object = "EXIOBASE/v3.10.2/consolidated/output_long_ALL.parquet",
+  bucket = "projet-esteem",
+  opts   = list("region" = "")
+)
+```
+
+```{r apercu-donnees}
+# aperçu général des structures
+glimpse(final_demand)
+glimpse(intermediate)
+glimpse(output)
+```
+
+# Sauvegarde locale
+
+Sauvegarde des fichiers `intermediate`, `final_demand`, `output` sur le bucket personnel pour accélérer les rechargements ultérieurs.
+
+```{r sauvegarde, eval=FALSE}
+s3write_using(
+  FUN    = saveRDS,
+  x      = intermediate,
+  object = "s3://projet-esteem/EXIOBASE/projesgap2.rds",
+  bucket = "projet-esteem",
+  opts   = list("region" = "")
+)
+
+s3write_using(
+  FUN    = saveRDS,
+  x      = final_demand,
+  object = "s3://projet-esteem/EXIOBASE/projesgap2.rds",
+  bucket = "projet-esteem",
+  opts   = list("region" = "")
+)
+
+s3write_using(
+  FUN    = saveRDS,
+  x      = output,
+  object = "s3://projet-esteem/EXIOBASE/projesgap2.rds",
+  bucket = "projet-esteem",
+  opts   = list("region" = "")
+)
+```
+
+---
+
+# Exploration initiale des données
+
+## Inventaire des stressors et secteurs
+
+```{r exploration-initiale}
+# valeurs uniques des stressors dans intermediate
+stressors_parquet <- sort(unique(intermediate$stressor))
+
+# valeurs uniques des secteurs dans intermediate
+secteurs_parquet <- sort(unique(intermediate$secteur))
+
+# décompte
+cat("Nombre total de stressors :", length(stressors_parquet), "\n")
+cat("Nombre total de secteurs  :", length(secteurs_parquet), "\n")
+```
+
+```{r apercu-stressors}
+# aperçu des formats
+head(stressors_parquet, 30)
+head(secteurs_parquet, 30)
+```
+
+---
+
+# Corrections de nomenclature
+
+L'analyse comparative entre les noms du parquet et ceux du fichier de mapping ESGAP révèle plusieurs écarts de nomenclature qu'il faut corriger avant tout filtrage.
+
+## Correction des secteurs (suppression des codes ISIC)
+
+Certains secteurs portent un code ISIC entre parenthèses (par exemple `Air transport (62)`). On l'enlève pour aligner avec notre mapping Excel.
+
+```{r correction-secteurs}
+# fonction qui supprime les codes ISIC entre parenthèses en fin de nom
+corriger_secteur <- function(nom) {
+  gsub(" \\(\\d+\\)$", "", trimws(nom))
+}
+
+# vérification rapide
+head(corriger_secteur(secteurs_parquet), 10)
+
+# application sur les deux tables qui ont des secteurs
+intermediate <- intermediate %>% mutate(secteur = corriger_secteur(secteur))
+output       <- output       %>% mutate(secteur = corriger_secteur(secteur))
+```
+
+## Correction des stressors
+
+Cinq types d'écarts de nomenclature ont été identifiés et documentés.
+
+### Groupe 1 — Abréviations dans le parquet
+
+Le parquet utilise des abréviations alors que notre mapping utilise les noms complets (HAP, PCB, etc.).
+
+```{r table-corr-stressors}
+table_corr_stressors <- data.frame(
+  stressor_parquet = c(
+    "B(a)P - combustion - air",
+    "B(b)F - combustion - air",
+    "B(k)F - combustion - air",
+    "Indeno - combustion - air",
+    "PCB - combustion - air",
+    "PCDD/F - combustion - air",
+    "PM2_5 - combustion - air",
+    "Cropland - cropped area - Wheat",
+    "Cropland - cropped area - Cereal grains nec",
+    "Cropland - cropped area - Oil seeds",
+    "Cropland - cropped area - Vegetables, fruit, nuts",
+    "Cropland - cropped area - Crops nec"
+  ),
+  stressor_mapping = c(
+    "Benzo(a)pyrene - combustion - air",
+    "Benzo(b)fluoranthene - combustion - air",
+    "Benzo(k)fluoranthene - combustion - air",
+    "Indeno(1,2,3-cd)pyrene - combustion - air",
+    "PCBs - combustion - air",
+    "PCDD_F - combustion - air",
+    "PM2.5 - combustion - air",
+    "Cropland - Wheat",
+    "Cropland - Cereal grains nec",
+    "Cropland - Oil seeds",
+    "Cropland - Vegetables, fruit, nuts",
+    "Cropland - Crops nec"
+  ),
+  stringsAsFactors = FALSE
+)
+```
+
+### Groupe 2 — Stressors dont le nom est identique
+
+Pas besoin de correction, on les intègre tels quels pour cohérence.
+
+```{r stressors-directs}
+stressors_directs <- c(
+  "CO2 - combustion - air",
+  "CO2 - non combustion - Cement production - air",
+  "CO2 - non combustion - Lime production - air",
+  "CO2 - agriculture - peat decay - air",
+  "CO2 - waste - fossil - air",
+  "CO2 - waste - biogenic - air",
+  "NH3 - agriculture - air",
+  "NOx - combustion - air",
+  "SOx - combustion - air",
+  "N - agriculture - water",
+  "P - agriculture - water",
+  "N - waste - water",
+  "P - waste - water",
+  "CH4 - agriculture - air",
+  "N2O - agriculture - air",
+  "N2O - combustion - air",
+  "HFC - air",
+  "SF6 - air",
+  "Hg - combustion - air",
+  "Cd - combustion - air",
+  "Pb - combustion - air",
+  "As - combustion - air",
+  "Ni - combustion - air",
+  "Cr - combustion - air",
+  "NMVOC - combustion - air",
+  "P - agriculture - soil",
+  "PAH - non combustion - Pig iron production, blast furnace - air",
+  "PAH - non combustion - Production of coke oven coke - air",
+  "PAH - non combustion - Steel production: basic oxygen furnace - air",
+  "PAH - non combustion - Steel production: electric arc furnace - air",
+  "PCB - non combustion - Pig iron production, blast furnace - air",
+  "PCB - non combustion - Steel production: basic oxygen furnace - air",
+  "Water Consumption Blue - Agriculture - wheat",
+  "Water Consumption Blue - Agriculture - other cereals",
+  "Water Consumption Blue - Agriculture - vegetables",
+  "Water Consumption Blue - Agriculture - fruits",
+  "Water Consumption Blue - Agriculture - other crops",
+  "Water Consumption Blue - Agriculture - fodder crops",
+  "Water Consumption Blue - Electricity - tower - Electricity by coal",
+  "Water Consumption Blue - Electricity - tower - Electricity by nuclear",
+  "Water Consumption Blue - Electricity - once-through - Electricity by coal",
+  "Water Consumption Blue - Electricity - once-through - Electricity by nuclear",
+  "Domestic Extraction Used - Fishery - Wild fish catch"
+)
+```
+
+### Groupe 3 — Stressors existants dans le parquet mais avec un nom différent
+
+Cas d'agrégations ou de terminologie différente.
+
+```{r table-corr-groupe-B}
+table_corr_groupe_B <- data.frame(
+  stressor_parquet = c(
+    "Domestic Extraction Used - Forestry - Timber (Industrial roundwood)",
+    "Domestic Extraction Used - Forestry - Wood fuel and other extraction",
+    "Domestic Extraction Used - Fishery - Wild fish catch",
+    "Cropland - cropped area - Sugar cane, sugar beet",
+    "Cropland - fallowed area-Cattle",
+    "Cropland - fallowed area-Pigs",
+    "Cropland - fallowed area-Raw milk",
+    "Forest",
+    "Domestic Extraction Used - Non-Metallic Minerals - Ornamental or building stone"
+  ),
+  stressor_mapping = c(
+    "Domestic Extraction Used - Forestry - Coniferous wood - Industrial roundwood",
+    "Domestic Extraction Used - Forestry - Coniferous wood - Wood fuel",
+    "Domestic Extraction Used - Fishery - Marine fish catch",
+    "Cropland - Sugar cane, sugar beet",
+    "Cropland - Fodder crops-Cattle",
+    "Cropland - Fodder crops-Pigs",
+    "Cropland - Fodder crops-Raw milk",
+    "Forest area - Forestry",
+    "Domestic Extraction Used - Non-Metallic Minerals - Building stones"
+  ),
+  stringsAsFactors = FALSE
+)
+```
+
+## Fusion et application des corrections
+
+```{r fusion-corrections}
+# fusion des 3 sous-tables en une table de correction complète
+table_corr_stressors_complete <- rbind(
+  table_corr_stressors,
+  data.frame(
+    stressor_parquet = stressors_directs,
+    stressor_mapping = stressors_directs,
+    stringsAsFactors = FALSE
+  ),
+  table_corr_groupe_B
+)
+
+# dédupliquer : Wild fish catch apparaît deux fois (identité + groupe B)
+# on garde la dernière ligne pour que Marine fish catch ait la priorité
+table_corr_final <- table_corr_stressors_complete %>%
+  group_by(stressor_parquet) %>%
+  slice_tail(n = 1) %>%
+  ungroup()
+
+# application sur intermediate
+# les stressors non listés dans la table restent tels quels
+intermediate <- intermediate %>%
+  left_join(table_corr_final, by = c("stressor" = "stressor_parquet")) %>%
+  mutate(stressor = ifelse(is.na(stressor_mapping), stressor, stressor_mapping)) %>%
+  select(-stressor_mapping)
+```
+
+## Vérification des corrections
+
+```{r verif-corrections}
+# vérification rapide que les noms corrigés sont bien présents
+intermediate %>%
+  filter(stressor %in% c(
+    "Benzo(a)pyrene - combustion - air",
+    "PM2.5 - combustion - air",
+    "PCBs - combustion - air",
+    "PCDD_F - combustion - air"
+  )) %>%
+  distinct(stressor)
+```
+
+---
+
+# Diagnostic présence/absence dans EXIOBASE
+
+Avant de construire la table de mapping, on vérifie quels stressors du fichier recap ESGAP × EXIOBASE sont effectivement présents dans `intermediate` et lesquels manquent.
+
+```{r liste-recap}
+# liste complète des stressors mentionnés dans le fichier recap par indicateur
+stressors_recap <- c(
+  # Ind. 01
+  "Domestic Extraction Used - Forestry - Coniferous wood - Industrial roundwood",
+  "Domestic Extraction Used - Forestry - Coniferous wood - Wood fuel",
+  "P - agriculture - soil", "N - agriculture - water",
+  # Ind. 02
+  "Domestic Extraction Used - Fishery - Marine fish catch",
+  "Domestic Extraction Used - Fishery - Inland waters fish catch",
+  "HCB - combustion - air", "Hg - combustion - air",
+  "Pb - combustion - air", "P - agriculture - water",
+  "N2O - combustion - air", "N - waste - water",
+  "P - waste - water", "CO2 - combustion - air",
+  # Ind. 03
+  "Water Consumption Blue - Agriculture - wheat",
+  "Water Consumption Blue - Agriculture - other cereals",
+  "Water Consumption Blue - Agriculture - vegetables",
+  "Water Consumption Blue - Agriculture - fruits",
+  "Water Consumption Blue - Agriculture - other crops",
+  "Water Consumption Blue - Agriculture - fodder crops",
+  "Water Consumption Blue - Electricity - tower - Electricity by coal",
+  "Water Consumption Blue - Electricity - tower - Electricity by nuclear",
+  "Water Consumption Blue - Electricity - once-through - Electricity by coal",
+  "Water Consumption Blue - Electricity - once-through - Electricity by nuclear",
+  "Water Consumption Blue - Domestic - domestic Water Consumption Blue",
+  "As - combustion - air", "Cd - combustion - air",
+  "Ni - combustion - air", "Cr - combustion - air",
+  # Ind. 04
+  "Water Consumption Blue - Electricity - tower - Electricity by gas",
+  "Water Consumption Blue - Manufacturing - Chemicals nec",
+  "Water Consumption Blue - Manufacturing - Basic iron and steel and of ferro-alloys and first products thereof",
+  # Ind. 05
+  "Cropland - Wheat", "Cropland - Cereal grains nec",
+  "Cropland - Oil seeds", "Cropland - Sugar cane, sugar beet",
+  "Cropland - Vegetables, fruit, nuts", "Cropland - Crops nec",
+  "Permanent pastures - Grazing-Cattle",
+  "Permanent pastures - Grazing-Meat animals nec",
+  "Permanent pastures - Grazing-Raw milk",
+  "Infrastructure land",
+  # Ind. 06
+  "CO2 - non combustion - Cement production - air",
+  "CO2 - non combustion - Lime production - air",
+  "CO2 - agriculture - peat decay - air",
+  # Ind. 08
+  "NOx - combustion - air", "NMVOC - combustion - air",
+  "NMVOC - non combustion - Gasoline distribution - service stations - air",
+  "NMVOC - non combustion - Gasoline distribution - transport and depots (used in mobile sources) - air",
+  "NMVOC - non combustion - Diesel distribution - transport and depots (used in mobile sources) - air",
+  "NOx - non combustion - Cement production - air",
+  "NOx - non combustion - Glass production - air",
+  "NOx - non combustion - Lime production - air",
+  "NOx - non combustion - Pig iron production, blast furnace - air",
+  "NOx - non combustion - Steel production: basic oxygen furnace - air",
+  "NOx - non combustion - Steel production: electric arc furnace - air",
+  "NOx - non combustion - Oil refinery - air",
+  "NH3 - agriculture - air", "NOX - agriculture - air",
+  "N2O - agriculture - air", "CH4 - agriculture - air",
+  "NMVOC - non combustion - Industrial application of adhesives (use of high performance solvent based adhesives) - air",
+  "NMVOC - non combustion - Industrial application of adhesives (use of traditional solvent based adhesives) - air",
+  "NMVOC - non combustion - Industrial paint application, general industry - air",
+  "NMVOC - non combustion - Industrial paint application, general industry (continuous processes) - air",
+  "NMVOC - non combustion - Other industrial use of solvents - air",
+  "NMVOC - non combustion - Degreasing - air",
+  "NMVOC - non combustion - Dry cleaning - air",
+  "NMVOC - non combustion - Organic chemical industry - downstream units - air",
+  "NMVOC - non combustion - Organic chemical industry, storage - air",
+  "NMVOC - non combustion - Vehicle refinishing - air",
+  "NMVOC - non combustion - Beef and veal - air",
+  "NMVOC - non combustion - Mutton and lamb - air",
+  "NMVOC - non combustion - Pork - air",
+  "NMVOC - non combustion - Poultry, dressed - air",
+  # Ind. 09
+  "SOx - combustion - air",
+  "SOx - non combustion - Pig iron production, blast furnace - air",
+  "SOx - non combustion - Steel production: basic oxygen furnace - air",
+  "SOx - non combustion - Agglomeration plant - sinter - air",
+  "SOx - non combustion - Cement production - air",
+  "SOx - non combustion - Oil refinery - air",
+  "SOx - non combustion - Production of coke oven coke - air",
+  # Ind. 10
+  "Hg - non combustion - Pig iron production, blast furnace - air",
+  "Hg - non combustion - Steel production: basic oxygen furnace - air",
+  "Hg - non combustion - Refined lead, unwrought - air",
+  "Hg - non combustion - Zinc, unwrought, not alloyed - air",
+  "Cd - non combustion - Steel production: basic oxygen furnace - air",
+  "Cd - non combustion - Zinc, unwrought, not alloyed - air",
+  "PCB - non combustion - Agglomeration plant - sinter - air",
+  "PAH - non combustion - Agglomeration plant - sinter - air",
+  # Ind. 11
+  "As - non combustion - Agglomeration plant - sinter - air",
+  "As - non combustion - Steel production: basic oxygen furnace - air",
+  "Cr - non combustion - Pig iron production, blast furnace - air",
+  "Cr - non combustion - Steel production: basic oxygen furnace - air",
+  "PCB - non combustion - Steel production: electric arc furnace - air",
+  "Benzo(a)pyrene - combustion - air",
+  # Ind. 12
+  "Benzo(b)fluoranthene - combustion - air",
+  "Indeno(1,2,3-cd)pyrene - combustion - air",
+  "PCBs - combustion - air",
+  "PCDD_F - combustion - air",
+  "PCDD/F - non combustion - Pig iron production, blast furnace - air",
+  "PCDD/F - non combustion - Steel production: basic oxygen furnace - air",
+  "PCDD/F - non combustion - Secondary aluminium production - air",
+  # Ind. 13
+  "Cropland - Fodder crops-Cattle", "Cropland - Fodder crops-Pigs",
+  "Cropland - Fodder crops-Raw milk",
+  "Other land Use: Total", "Forest area - Forestry",
+  "Domestic Extraction Used - Forestry - Non-coniferous wood - Industrial roundwood",
+  # Ind. 14
+  "Water Consumption Blue - Electricity - tower - Electricity by hydro",
+  "Water Consumption Blue - Electricity - once-through - Electricity by hydro",
+  "Water Withdrawal Blue - Electricity - tower - Electricity by hydro",
+  "Water Withdrawal Blue - Electricity - once-through - Electricity by hydro",
+  "Domestic Extraction Used - Non-Metallic Minerals - Building stones",
+  # Ind. 16
+  "PM2.5 - combustion - air",
+  "PM2.5 - non combustion - Pig iron production, blast furnace - air",
+  "PM2.5 - non combustion - Steel production: basic oxygen furnace - air",
+  "PM2.5 - non combustion - Steel production: electric arc furnace - air",
+  "PM2.5 - non combustion - Steel production: open hearth furnace - air",
+  "PM2.5 - non combustion - Agglomeration plant - sinter - air",
+  "PM2.5 - non combustion - Agglomeration plant - pellets - air",
+  "PM2.5 - non combustion - Cement production - air",
+  "PM2.5 - non combustion - Lime production - air",
+  "PM2.5 - non combustion - Oil refinery - air",
+  "PM2.5 - non combustion - Production of coke oven coke - air",
+  "PM2.5 - non combustion - Cast iron production (grey iron foundries) - air",
+  "PM2.5 - non combustion - Primary aluminium production - air",
+  "PM2.5 - non combustion - Secondary aluminium production - air",
+  # Ind. 18
+  "Pb - non combustion - Steel production: basic oxygen furnace - air"
+)
+
+# dédoublonnage
+stressors_recap <- unique(stressors_recap)
+```
+
+```{r diagnostic-presence}
+# diagnostic présence/absence
+presents <- stressors_recap[stressors_recap %in% unique(intermediate$stressor)]
+absents  <- stressors_recap[!stressors_recap %in% unique(intermediate$stressor)]
+
+cat("Stressors trouvés dans intermediate :", length(presents), "\n")
+cat("Stressors absents dans intermediate :", length(absents), "\n\n")
+cat("--- ABSENTS ---\n")
+print(absents)
+```
+
+**Stressors documentés comme absents d'EXIOBASE v3.10.2 :**
+
+- `Water Consumption Blue - Domestic - domestic Water Consumption Blue`
+- `Infrastructure land` et `Other land Use: Total`
+- `NOX - agriculture - air` (n'existe pas comme extension distincte dans EXIOBASE)
+- `Water Consumption Blue / Withdrawal - Electricity - hydro` (aucune entrée)
+
+Ces lacunes sont structurelles et documentées — on travaille avec le reste des stressors disponibles.
+
+---
+
+# Construction de la table de mapping centrale
+
+Cette table associe chaque stressor à son indicateur ESGAP, sa fonction du capital naturel, son principe de soutenabilité et sa rubrique. Elle servira de filtre central et de référence pour toutes les agrégations.
+
+## Définition par indicateur
+
+```{r mapping-ind01}
+# Ind. 01 - Taux d'utilisation des forêts
+mapping_ind01 <- data.frame(
+  stressor = c(
+    "Domestic Extraction Used - Forestry - Coniferous wood - Industrial roundwood",
+    "Domestic Extraction Used - Forestry - Coniferous wood - Wood fuel",
+    "P - agriculture - soil",
+    "N - agriculture - water"
+  ),
+  indicateur = "Ind. 01",
+  fonction   = "Fonctions sources",
+  principe   = "Renouveler les ressources renouvelables",
+  rubrique   = "Biomasse"
+)
+```
+
+```{r mapping-ind02}
+# Ind. 02 - Stocks de poissons dans des limites biologiques sûres
+mapping_ind02 <- data.frame(
+  stressor = c(
+    "Domestic Extraction Used - Fishery - Marine fish catch",
+    "Benzo(a)pyrene - combustion - air", "PCBs - combustion - air",
+    "PCDD_F - combustion - air", "HCB - combustion - air",
+    "Hg - combustion - air", "Indeno(1,2,3-cd)pyrene - combustion - air",
+    "Pb - combustion - air", "N - agriculture - water",
+    "P - agriculture - water", "N2O - combustion - air",
+    "N - waste - water", "P - waste - water", "CO2 - combustion - air"
+  ),
+  indicateur = "Ind. 02",
+  fonction   = "Fonctions sources",
+  principe   = "Renouveler les ressources renouvelables",
+  rubrique   = "Biomasse"
+)
+```
+
+```{r mapping-ind03}
+# Ind. 03 - Nappes phréatiques en bon état quantitatif
+mapping_ind03 <- data.frame(
+  stressor = c(
+    "Water Consumption Blue - Agriculture - wheat",
+    "Water Consumption Blue - Agriculture - other cereals",
+    "Water Consumption Blue - Agriculture - vegetables",
+    "Water Consumption Blue - Agriculture - fruits",
+    "Water Consumption Blue - Agriculture - other crops",
+    "Water Consumption Blue - Agriculture - fodder crops",
+    "Water Consumption Blue - Electricity - tower - Electricity by coal",
+    "Water Consumption Blue - Electricity - tower - Electricity by nuclear",
+    "Water Consumption Blue - Electricity - once-through - Electricity by coal",
+    "Water Consumption Blue - Electricity - once-through - Electricity by nuclear",
+    "N - agriculture - water", "P - agriculture - water",
+    "As - combustion - air", "Cd - combustion - air",
+    "Hg - combustion - air", "Pb - combustion - air",
+    "Ni - combustion - air", "Cr - combustion - air",
+    "Benzo(a)pyrene - combustion - air", "PCBs - combustion - air",
+    "CO2 - combustion - air"
+  ),
+  indicateur = "Ind. 03",
+  fonction   = "Fonctions sources",
+  principe   = "Renouveler les ressources renouvelables",
+  rubrique   = "Eau douce"
+)
+```
+
+```{r mapping-ind04}
+# Ind. 04 - Plans d'eau douce non soumis à un stress hydrique
+mapping_ind04 <- data.frame(
+  stressor = c(
+    "Water Consumption Blue - Agriculture - wheat",
+    "Water Consumption Blue - Agriculture - other cereals",
+    "Water Consumption Blue - Agriculture - vegetables",
+    "Water Consumption Blue - Agriculture - fruits",
+    "Water Consumption Blue - Agriculture - other crops",
+    "Water Consumption Blue - Agriculture - fodder crops",
+    "Water Consumption Blue - Electricity - tower - Electricity by coal",
+    "Water Consumption Blue - Electricity - tower - Electricity by gas",
+    "Water Consumption Blue - Electricity - tower - Electricity by nuclear",
+    "Water Consumption Blue - Electricity - once-through - Electricity by coal",
+    "Water Consumption Blue - Electricity - once-through - Electricity by nuclear",
+    "Water Consumption Blue - Manufacturing - Chemicals nec",
+    "Water Consumption Blue - Manufacturing - Basic iron and steel and of ferro-alloys and first products thereof"
+  ),
+  indicateur = "Ind. 04",
+  fonction   = "Fonctions sources",
+  principe   = "Renouveler les ressources renouvelables",
+  rubrique   = "Eau douce"
+)
+```
+
+```{r mapping-ind05}
+# Ind. 05 - Surfaces avec érosion des sols tolérable
+mapping_ind05 <- data.frame(
+  stressor = c(
+    "Cropland - Wheat", "Cropland - Cereal grains nec",
+    "Cropland - Oil seeds", "Cropland - Sugar cane, sugar beet",
+    "Cropland - Vegetables, fruit, nuts", "Cropland - Crops nec",
+    "Permanent pastures - Grazing-Cattle",
+    "Permanent pastures - Grazing-Meat animals nec",
+    "Permanent pastures - Grazing-Raw milk", "CO2 - combustion - air"
+  ),
+  indicateur = "Ind. 05",
+  fonction   = "Fonctions sources",
+  principe   = "Utiliser les énergies non renouvelables avec prudence",
+  rubrique   = "Sol"
+)
+```
+
+```{r mapping-ind06}
+# Ind. 06 - Émissions de CO2 par habitant
+mapping_ind06 <- data.frame(
+  stressor = c(
+    "CO2 - combustion - air",
+    "CO2 - non combustion - Cement production - air",
+    "CO2 - non combustion - Lime production - air",
+    "CO2 - agriculture - peat decay - air"
+  ),
+  indicateur = "Ind. 06",
+  fonction   = "Fonctions Sink",
+  principe   = "Prévenir le réchauffement climatique et l'appauvrissement de la couche d'ozone",
+  rubrique   = "Système terrestre"
+)
+```
+
+```{r mapping-ind08}
+# Ind. 08 - Terres cultivées et forêts exposées à des niveaux d'ozone sûrs
+mapping_ind08 <- data.frame(
+  stressor = c(
+    "NOx - combustion - air", "NMVOC - combustion - air",
+    "NMVOC - non combustion - Gasoline distribution - service stations - air",
+    "NMVOC - non combustion - Gasoline distribution - transport and depots (used in mobile sources) - air",
+    "NMVOC - non combustion - Diesel distribution - transport and depots (used in mobile sources) - air",
+    "NOx - non combustion - Cement production - air",
+    "NOx - non combustion - Glass production - air",
+    "NOx - non combustion - Lime production - air",
+    "NOx - non combustion - Pig iron production, blast furnace - air",
+    "NOx - non combustion - Steel production: basic oxygen furnace - air",
+    "NOx - non combustion - Steel production: electric arc furnace - air",
+    "NOx - non combustion - Oil refinery - air",
+    "NH3 - agriculture - air", "N2O - agriculture - air",
+    "CH4 - agriculture - air",
+    "NMVOC - non combustion - Industrial application of adhesives (use of high performance solvent based adhesives) - air",
+    "NMVOC - non combustion - Industrial application of adhesives (use of traditional solvent based adhesives) - air",
+    "NMVOC - non combustion - Industrial paint application, general industry - air",
+    "NMVOC - non combustion - Industrial paint application, general industry (continuous processes) - air",
+    "NMVOC - non combustion - Other industrial use of solvents - air",
+    "NMVOC - non combustion - Degreasing - air",
+    "NMVOC - non combustion - Dry cleaning - air",
+    "NMVOC - non combustion - Organic chemical industry - downstream units - air",
+    "NMVOC - non combustion - Organic chemical industry, storage - air",
+    "NMVOC - non combustion - Vehicle refinishing - air",
+    "NMVOC - non combustion - Beef and veal - air",
+    "NMVOC - non combustion - Mutton and lamb - air",
+    "NMVOC - non combustion - Pork - air",
+    "NMVOC - non combustion - Poultry, dressed - air",
+    "CO2 - combustion - air"
+  ),
+  indicateur = "Ind. 08",
+  fonction   = "Fonctions Sink",
+  principe   = "Respecter les charges critiques pour les écosystèmes",
+  rubrique   = "Écosystèmes terrestres"
+)
+```
+
+```{r mapping-ind09}
+# Ind. 09 - Eutrophisation et acidification
+mapping_ind09 <- data.frame(
+  stressor = c(
+    "NH3 - agriculture - air", "CH4 - agriculture - air",
+    "N - agriculture - water", "NOx - combustion - air",
+    "NMVOC - combustion - air",
+    "NOx - non combustion - Pig iron production, blast furnace - air",
+    "NOx - non combustion - Steel production: basic oxygen furnace - air",
+    "NOx - non combustion - Steel production: electric arc furnace - air",
+    "NOx - non combustion - Cement production - air",
+    "NOx - non combustion - Oil refinery - air",
+    "SOx - combustion - air",
+    "SOx - non combustion - Pig iron production, blast furnace - air",
+    "SOx - non combustion - Agglomeration plant - sinter - air",
+    "SOx - non combustion - Cement production - air",
+    "SOx - non combustion - Oil refinery - air",
+    "SOx - non combustion - Production of coke oven coke - air",
+    "CO2 - combustion - air"
+  ),
+  indicateur = "Ind. 09",
+  fonction   = "Fonctions Sink",
+  principe   = "Respecter les charges critiques pour les écosystèmes",
+  rubrique   = "Écosystèmes terrestres"
+)
+```
+
+```{r mapping-ind10}
+# Ind. 10 - Masses d'eau de surface en bon état chimique
+mapping_ind10 <- data.frame(
+  stressor = c(
+    "N - agriculture - water", "P - agriculture - water",
+    "Hg - combustion - air",
+    "Hg - non combustion - Pig iron production, blast furnace - air",
+    "Hg - non combustion - Steel production: basic oxygen furnace - air",
+    "Hg - non combustion - Refined lead, unwrought - air",
+    "Hg - non combustion - Zinc, unwrought, not alloyed - air",
+    "Cd - combustion - air",
+    "Cd - non combustion - Steel production: basic oxygen furnace - air",
+    "Cd - non combustion - Zinc, unwrought, not alloyed - air",
+    "Ni - combustion - air", "Pb - combustion - air",
+    "Benzo(a)pyrene - combustion - air",
+    "Benzo(b)fluoranthene - combustion - air",
+    "Indeno(1,2,3-cd)pyrene - combustion - air",
+    "PCBs - combustion - air",
+    "PCB - non combustion - Agglomeration plant - sinter - air",
+    "PAH - non combustion - Production of coke oven coke - air",
+    "PAH - non combustion - Pig iron production, blast furnace - air",
+    "PAH - non combustion - Steel production: basic oxygen furnace - air",
+    "PAH - non combustion - Steel production: electric arc furnace - air",
+    "PAH - non combustion - Agglomeration plant - sinter - air",
+    "N - waste - water", "P - waste - water", "CO2 - combustion - air"
+  ),
+  indicateur = "Ind. 10",
+  fonction   = "Fonctions Sink",
+  principe   = "Respecter les charges critiques pour les écosystèmes",
+  rubrique   = "Écosystèmes d'eau douce"
+)
+```
+
+```{r mapping-ind11}
+# Ind. 11 - Nappes phréatiques en bon état chimique
+mapping_ind11 <- data.frame(
+  stressor = c(
+    "N - agriculture - water", "P - agriculture - water",
+    "Hg - combustion - air",
+    "Hg - non combustion - Pig iron production, blast furnace - air",
+    "Cd - combustion - air",
+    "Cd - non combustion - Zinc, unwrought, not alloyed - air",
+    "Pb - combustion - air",
+    "As - non combustion - Agglomeration plant - sinter - air",
+    "As - non combustion - Steel production: basic oxygen furnace - air",
+    "Cr - non combustion - Pig iron production, blast furnace - air",
+    "Cr - non combustion - Steel production: basic oxygen furnace - air",
+    "N - waste - water", "P - waste - water",
+    "PCBs - combustion - air",
+    "PCB - non combustion - Pig iron production, blast furnace - air",
+    "PCB - non combustion - Steel production: basic oxygen furnace - air",
+    "PCB - non combustion - Steel production: electric arc furnace - air",
+    "Benzo(a)pyrene - combustion - air", "CO2 - combustion - air"
+  ),
+  indicateur = "Ind. 11",
+  fonction   = "Fonctions Sink",
+  principe   = "Respecter les charges critiques pour les écosystèmes",
+  rubrique   = "Écosystèmes d'eau douce"
+)
+```
+
+```{r mapping-ind12}
+# Ind. 12 - Masses d'eau côtières en bon état chimique
+mapping_ind12 <- data.frame(
+  stressor = c(
+    "N - agriculture - water", "P - agriculture - water",
+    "Hg - combustion - air", "Cd - combustion - air", "Pb - combustion - air",
+    "Benzo(a)pyrene - combustion - air",
+    "Benzo(b)fluoranthene - combustion - air",
+    "Indeno(1,2,3-cd)pyrene - combustion - air",
+    "PAH - non combustion - Production of coke oven coke - air",
+    "PAH - non combustion - Pig iron production, blast furnace - air",
+    "PCBs - combustion - air",
+    "PCB - non combustion - Pig iron production, blast furnace - air",
+    "PCB - non combustion - Steel production: basic oxygen furnace - air",
+    "PCDD_F - combustion - air",
+    "PCDD/F - non combustion - Pig iron production, blast furnace - air",
+    "PCDD/F - non combustion - Steel production: basic oxygen furnace - air",
+    "PCDD/F - non combustion - Secondary aluminium production - air",
+    "NOx - combustion - air", "SOx - combustion - air",
+    "N - waste - water", "P - waste - water", "CO2 - combustion - air"
+  ),
+  indicateur = "Ind. 12",
+  fonction   = "Fonctions Sink",
+  principe   = "Respecter les charges critiques pour les écosystèmes",
+  rubrique   = "Écosystèmes marins"
+)
+```
+
+```{r mapping-ind13}
+# Ind. 13 - Habitats terrestres en état de conservation favorable
+mapping_ind13 <- data.frame(
+  stressor = c(
+    "NH3 - agriculture - air", "N - agriculture - water",
+    "P - agriculture - water", "P - agriculture - soil",
+    "Cropland - Wheat", "Cropland - Cereal grains nec",
+    "Cropland - Oil seeds", "Cropland - Crops nec",
+    "Cropland - Fodder crops-Cattle", "Cropland - Fodder crops-Pigs",
+    "Cropland - Fodder crops-Raw milk", "NOx - combustion - air",
+    "Forest area - Forestry",
+    "Domestic Extraction Used - Forestry - Coniferous wood - Industrial roundwood",
+    "Domestic Extraction Used - Forestry - Coniferous wood - Wood fuel",
+    "CO2 - combustion - air"
+  ),
+  indicateur = "Ind. 13",
+  fonction   = "Fonctions de survie",
+  principe   = "Maintenir la biodiversité et la santé des écosystèmes",
+  rubrique   = "Écosystèmes terrestres"
+)
+```
+
+```{r mapping-ind14}
+# Ind. 14 - Masses d'eau de surface en bon état écologique
+mapping_ind14 <- data.frame(
+  stressor = c(
+    "N - agriculture - water", "P - agriculture - water",
+    "Domestic Extraction Used - Non-Metallic Minerals - Building stones",
+    "Water Consumption Blue - Agriculture - wheat",
+    "Water Consumption Blue - Agriculture - other cereals",
+    "Water Consumption Blue - Agriculture - vegetables",
+    "Water Consumption Blue - Agriculture - fruits",
+    "Water Consumption Blue - Agriculture - other crops",
+    "Water Consumption Blue - Agriculture - fodder crops",
+    "N - waste - water", "P - waste - water", "CO2 - combustion - air"
+  ),
+  indicateur = "Ind. 14",
+  fonction   = "Fonctions de survie",
+  principe   = "Maintenir la biodiversité et la santé des écosystèmes",
+  rubrique   = "Écosystèmes d'eau douce"
+)
+```
+
+```{r mapping-ind15}
+# Ind. 15 - Masses d'eau côtières en bon état écologique
+mapping_ind15 <- data.frame(
+  stressor = c(
+    "N - agriculture - water", "P - agriculture - water",
+    "N - waste - water", "P - waste - water",
+    "Hg - combustion - air", "Cd - combustion - air", "Pb - combustion - air",
+    "Benzo(a)pyrene - combustion - air", "PCBs - combustion - air",
+    "Benzo(b)fluoranthene - combustion - air",
+    "Indeno(1,2,3-cd)pyrene - combustion - air",
+    "NOx - combustion - air", "SOx - combustion - air",
+    "Domestic Extraction Used - Fishery - Marine fish catch",
+    "CO2 - combustion - air"
+  ),
+  indicateur = "Ind. 15",
+  fonction   = "Fonctions de survie",
+  principe   = "Maintenir la biodiversité et la santé des écosystèmes",
+  rubrique   = "Écosystèmes marins"
+)
+```
+
+```{r mapping-ind16}
+# Ind. 16 - Population exposée à des niveaux de PM2.5 sans danger
+mapping_ind16 <- data.frame(
+  stressor = c(
+    "PM2.5 - combustion - air",
+    "PM2.5 - non combustion - Pig iron production, blast furnace - air",
+    "PM2.5 - non combustion - Steel production: basic oxygen furnace - air",
+    "PM2.5 - non combustion - Steel production: electric arc furnace - air",
+    "PM2.5 - non combustion - Steel production: open hearth furnace - air",
+    "PM2.5 - non combustion - Agglomeration plant - sinter - air",
+    "PM2.5 - non combustion - Agglomeration plant - pellets - air",
+    "PM2.5 - non combustion - Cement production - air",
+    "PM2.5 - non combustion - Lime production - air",
+    "PM2.5 - non combustion - Oil refinery - air",
+    "PM2.5 - non combustion - Production of coke oven coke - air",
+    "PM2.5 - non combustion - Cast iron production (grey iron foundries) - air",
+    "PM2.5 - non combustion - Primary aluminium production - air",
+    "PM2.5 - non combustion - Secondary aluminium production - air",
+    "NH3 - agriculture - air", "NOx - combustion - air",
+    "SOx - combustion - air", "CO2 - combustion - air"
+  ),
+  indicateur = "Ind. 16",
+  fonction   = "Fonctions de santé humaine et de bien-être",
+  principe   = "Respect des normes en matière de santé humaine",
+  rubrique   = "Santé humaine"
+)
+```
+
+```{r mapping-ind18}
+# Ind. 18 - Échantillons répondant aux critères de l'eau potable
+mapping_ind18 <- data.frame(
+  stressor = c(
+    "Pb - combustion - air",
+    "Pb - non combustion - Steel production: basic oxygen furnace - air",
+    "N - agriculture - water", "As - combustion - air",
+    "Cd - combustion - air", "Hg - combustion - air",
+    "Ni - combustion - air", "Cr - combustion - air",
+    "As - non combustion - Agglomeration plant - sinter - air",
+    "Cd - non combustion - Steel production: basic oxygen furnace - air",
+    "Hg - non combustion - Pig iron production, blast furnace - air",
+    "Cr - non combustion - Pig iron production, blast furnace - air",
+    "CO2 - combustion - air"
+  ),
+  indicateur = "Ind. 18",
+  fonction   = "Fonctions de santé humaine et de bien-être",
+  principe   = "Respect des normes en matière de santé humaine",
+  rubrique   = "Santé humaine"
+)
+```
+
+## Assemblage final
+
+```{r table-mapping}
+# fusion finale en une seule table de référence
+table_mapping <- rbind(
+  mapping_ind01, mapping_ind02, mapping_ind03, mapping_ind04,
+  mapping_ind05, mapping_ind06, mapping_ind08, mapping_ind09,
+  mapping_ind10, mapping_ind11, mapping_ind12, mapping_ind13,
+  mapping_ind14, mapping_ind15, mapping_ind16, mapping_ind18
+)
+
+# vérifications
+cat("Nombre total de paires stressor x indicateur :", nrow(table_mapping), "\n")
+cat("Nombre d'indicateurs couverts :", n_distinct(table_mapping$indicateur), "\n")
+cat("Nombre de stressors uniques :",   n_distinct(table_mapping$stressor),   "\n")
+cat("Nombre de fonctions couvertes :", n_distinct(table_mapping$fonction),   "\n\n")
+
+# décompte par indicateur
+table_mapping %>% count(indicateur) %>% arrange(indicateur)
+```
+
+---
+
+# Pipeline d'analyse en 5 étapes
+
+## Étape 1 — Pressions brutes
+
+On filtre `intermediate` sur les stressors retenus dans le mapping et on somme par pays × stressor × année. Cela donne la pression totale exercée par l'ensemble de l'économie d'un pays pour chaque extension environnementale.
+
+```{r etape1-pressions-brutes}
+pressions_brutes <- intermediate %>%
+  filter(stressor %in% table_mapping$stressor) %>%
+  group_by(pays, stressor, annee) %>%
+  summarise(pression_brute = sum(valeur, na.rm = TRUE), .groups = "drop")
+
+cat("Nombre de lignes :", nrow(pressions_brutes), "\n")
+cat("Pays couverts    :", n_distinct(pressions_brutes$pays), "\n")
+cat("Stressors        :", n_distinct(pressions_brutes$stressor), "\n")
+cat("Plage temporelle :", paste(range(pressions_brutes$annee), collapse = " - "), "\n")
+```
+
+## Étape 2 — Intensités de pression
+
+Suivant la recommandation de Matthieu, on rapporte la pression à l'output sectoriel pour neutraliser l'effet taille des économies.
+
+### 2a — Identification des secteurs émetteurs
+
+```{r etape2a-stressor-secteur}
+stressor_secteur <- intermediate %>%
+  filter(stressor %in% table_mapping$stressor) %>%
+  distinct(stressor, secteur)
+
+cat("Nombre de paires stressor x secteur :", nrow(stressor_secteur), "\n")
+```
+
+### 2b — Output total des secteurs émetteurs
+
+```{r etape2b-output-par-stressor}
+output_par_stressor <- output %>%
+  inner_join(stressor_secteur, by = "secteur",
+             relationship = "many-to-many") %>%
+  group_by(stressor, pays, annee) %>%
+  summarise(output_total = sum(valeur, na.rm = TRUE), .groups = "drop")
+
+# output couvre 49 pays EXIOBASE — on filtre sur les 28 pays ESGAP
+pays_esgap <- unique(pressions_brutes$pays)
+
+output_par_stressor <- output_par_stressor %>%
+  filter(pays %in% pays_esgap)
+
+cat("Lignes après filtre 28 pays ESGAP :", nrow(output_par_stressor), "\n")
+```
+
+### 2c — Calcul des intensités
+
+```{r etape2c-intensites}
+intensites <- pressions_brutes %>%
+  left_join(output_par_stressor, by = c("pays", "stressor", "annee")) %>%
+  mutate(intensite = ifelse(output_total > 0,
+                            pression_brute / output_total,
+                            NA_real_))
+
+cat("Distribution des intensités :\n")
+summary(intensites$intensite)
+
+cat("\nNAs (output nul) :", sum(is.na(intensites$intensite)), "\n")
+```
+
+## Étape 3 — Normalisation 0-100
+
+Méthode min-max avec percentiles 2.5 et 97.5 comme bornes (équation 3 d'Arkaitz). Les percentiles sont calculés **par stressor et par année** pour reproduire la logique transversale d'Arkaitz et éviter qu'une année historique élevée n'écrase les bornes.
+
+```{r etape3-normalisation}
+intensites_norm <- intensites %>%
+  group_by(stressor, annee) %>%
+  mutate(
+    p025  = quantile(intensite, 0.025, na.rm = TRUE),
+    p975  = quantile(intensite, 0.975, na.rm = TRUE),
+    score = ifelse(p975 > p025,
+                   100 * (intensite - p025) / (p975 - p025),
+                   0),
+    score = pmax(0, pmin(100, score))
+  ) %>%
+  ungroup() %>%
+  select(-p025, -p975)
+
+summary(intensites_norm$score)
+```
+
+## Étape 4 — Agrégation par indicateur ESGAP
+
+Moyenne géométrique des scores normalisés, avec un plancher à 5 comme Arkaitz pour éviter l'effondrement quand un stressor est nul.
+
+```{r etape4-scores-indicateur}
+scores_par_indicateur <- intensites_norm %>%
+  left_join(
+    table_mapping %>% select(stressor, indicateur, fonction, principe, rubrique),
+    by = "stressor",
+    relationship = "many-to-many"
+  ) %>%
+  group_by(pays, indicateur, annee, fonction, principe, rubrique) %>%
+  summarise(
+    score_indicateur = exp(mean(log(pmax(score, 5)), na.rm = TRUE)),
+    n_stressors      = sum(!is.na(score)),
+    .groups = "drop"
+  )
+
+summary(scores_par_indicateur$score_indicateur)
+```
+
+## Étape 5 — Agrégation par fonction ESGAP
+
+Moyenne géométrique des scores d'indicateurs pour obtenir un score pays × fonction.
+
+```{r etape5-scores-fonction}
+scores_par_fonction <- scores_par_indicateur %>%
+  group_by(pays, fonction, annee) %>%
+  summarise(
+    score_fonction = exp(mean(log(pmax(score_indicateur, 5)), na.rm = TRUE)),
+    n_indicateurs  = n_distinct(indicateur),
+    .groups = "drop"
+  )
+
+cat("Nombre de lignes :", nrow(scores_par_fonction), "\n")
+cat("Fonctions couvertes :", n_distinct(scores_par_fonction$fonction), "\n")
+summary(scores_par_fonction$score_fonction)
+head(scores_par_fonction)
+```
+
+---
+
+# Visualisations
+
+## Heatmap pays × fonction (année de référence)
+
+Heatmap structuré à la manière de la Fig. 3 d'Arkaitz, comparable visuellement mais alimenté par les pressions EXIOBASE.
+
+```{r heatmap-pays-fonction, fig.width=14, fig.height=5}
+annee_ref <- 2019
+
+# ordre des pays selon la pression totale décroissante
+ordre_pays <- scores_par_fonction %>%
+  filter(annee == annee_ref) %>%
+  group_by(pays) %>%
+  summarise(score_total = mean(score_fonction), .groups = "drop") %>%
+  arrange(desc(score_total)) %>%
+  pull(pays)
+
+heatmap_data <- scores_par_fonction %>%
+  filter(annee == annee_ref) %>%
+  mutate(pays = factor(pays, levels = ordre_pays))
+
+ggplot(heatmap_data, aes(x = pays, y = fonction, fill = score_fonction)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  scale_fill_distiller(
+    palette   = "RdBu",
+    direction = -1,
+    name      = "Score de\npression\n(0-100)"
+  ) +
+  labs(
+    title    = "Intensités de pression EXIOBASE par pays et fonction environnementale",
+    subtitle = paste("Année de référence :", annee_ref),
+    x        = "Pays (triés par pression totale décroissante)",
+    y        = "Fonction du capital naturel",
+    caption  = "Rouge foncé = pression élevée | Bleu foncé = pression faible\nMéthode : min-max percentiles 2.5/97.5 par année, moyenne géométrique, plancher = 5"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 9),
+    axis.text.y     = element_text(size = 10),
+    plot.title      = element_text(face = "bold", size = 12),
+    plot.subtitle   = element_text(size = 10),
+    legend.position = "right",
+    panel.grid      = element_blank()
+  )
+
+ggsave("heatmap_pression_EXIOBASE_2019.png",
+       width = 14, height = 5, dpi = 300)
+```
+
+## Évolution temporelle des fonctions
+
+Évolution moyenne des scores par fonction sur 1995-2022, en agrégeant les 28 pays par année.
+
+```{r evolution-fonctions, fig.width=10, fig.height=6}
+evolution_moyenne <- scores_par_fonction %>%
+  group_by(fonction, annee) %>%
+  summarise(score_moyen = mean(score_fonction), .groups = "drop")
+
+ggplot(evolution_moyenne, aes(x = annee, y = score_moyen, color = fonction)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5) +
+  labs(
+    title    = "Évolution des scores de pression moyens par fonction ESGAP",
+    subtitle = "Moyenne des 28 pays européens — 1995 à 2022",
+    x        = "Année",
+    y        = "Score de pression moyen (0-100)",
+    color    = "Fonction ESGAP"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+---
+
+# Diagnostics complémentaires
+
+## Diagnostic des zéros par stressor
+
+```{r diagnostic-zeros}
+intensites_norm %>%
+  group_by(stressor) %>%
+  summarise(
+    n_total       = n(),
+    n_zeros       = sum(score == 0, na.rm = TRUE),
+    n_vrais_zeros = sum(pression_brute == 0, na.rm = TRUE),
+    pct_zeros     = round(100 * n_zeros / n_total, 1)
+  ) %>%
+  arrange(desc(pct_zeros)) %>%
+  head(20)
+```
+
+## Couverture des stressors actifs par indicateur et par pays
+
+```{r diagnostic-couverture}
+intensites_norm %>%
+  left_join(table_mapping %>% select(stressor, indicateur),
+            by = "stressor",
+            relationship = "many-to-many") %>%
+  filter(annee == 2019) %>%
+  group_by(pays, indicateur) %>%
+  summarise(
+    n_stressors_total    = n(),
+    n_stressors_non_zero = sum(score > 0, na.rm = TRUE),
+    pct_non_zero         = round(100 * n_stressors_non_zero / n_stressors_total, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(pct_non_zero) %>%
+  head(20)
+```
+
+---
+
+# Notes méthodologiques
+
+**Sources et unités** (confirmées par Matthieu) :
+
+- Les pressions dans `intermediate` et `final_demand` sont exprimées dans les unités biophysiques natives d'EXIOBASE (kg, Mm³, km²... selon le fichier `unit_satellites`).
+- L'output dans `output` est exprimé en millions d'euros.
+- Les intensités calculées sont donc en unité_pression / M€.
+
+**Stressors documentés comme absents d'EXIOBASE v3.10.2** :
+
+- `Water Consumption Blue - Domestic - domestic Water Consumption Blue`
+- `Infrastructure land`
+- `Other land Use: Total`
+- `NOX - agriculture - air` (n'existe pas comme extension distincte ; les émissions agricoles de NOx sont partiellement capturées par `NOx - combustion - air` via les engins agricoles)
+- `Water Consumption Blue / Withdrawal - Electricity - hydro`
+
+Ces lacunes sont structurelles et documentées. L'analyse se poursuit avec les stressors disponibles.
+
+**Choix méthodologiques alignés sur Arkaitz** :
+
+- Normalisation min-max avec bornes percentiles 2.5/97.5, calculées par stressor et par année
+- Agrégation par moyenne géométrique (limited substitutability entre fonctions du capital naturel)
+- Plancher à 5 pour éviter l'effondrement de la moyenne géométrique en présence de zéros
+
+**Différence conceptuelle à signaler** :
+
+ESGAP mesure des **états** environnementaux ; EXIOBASE mesure des **pressions** environnementales. Ces deux systèmes ne sont pas directement comparables — toute comparaison doit être interprétée avec prudence en distinguant cohérence directionnelle et causalité.
+
+
+# =============================================================================
+# PHASE 2 — ANALYSE APPROFONDIE DE L'INDICATEUR 01 (FORÊTS)
+# =============================================================================
+
+#  - récupération du second stressor (Wood fuel)
+#  - statistiques par stressor et contribution relative
+#  - agrégation des deux pour obtenir l'extraction forestière totale
+#  - séries temporelles 1995-2022
+#  - jointure avec la surface forestière (données Banque mondiale)
+#  - calcul d'une intensité biophysique (t / km²) proche du
+#    Forest utilization rate d'Arkaitz
+#  - confrontation avec les scores ESGAP
+
+# =============================================================================
+# Section 1 — Récupération des deux stressors séparément
+# =============================================================================
+
+## Récupération du stressor 1 — Industrial roundwood (déjà connu)
+
+```{r ind01-stressor1}
+stressor1 <- "Domestic Extraction Used - Forestry - Coniferous wood - Industrial roundwood"
+
+pressions_s1 <- intermediate %>%
+  filter(stressor == stressor1) %>%
+  group_by(pays, annee) %>%
+  summarise(extraction_s1 = sum(valeur, na.rm = TRUE), .groups = "drop")
+
+cat("Stressor 1 — Industrial roundwood\n")
+cat("Pays couverts :", n_distinct(pressions_s1$pays), "\n")
+cat("Années        :", paste(range(pressions_s1$annee), collapse = " - "), "\n")
+```
+
+## Récupération du stressor 2 — Wood fuel
+
+```{r ind01-stressor2}
+stressor2 <- "Domestic Extraction Used - Forestry - Coniferous wood - Wood fuel"
+
+pressions_s2 <- intermediate %>%
+  filter(stressor == stressor2) %>%
+  group_by(pays, annee) %>%
+  summarise(extraction_s2 = sum(valeur, na.rm = TRUE), .groups = "drop")
+
+cat("Stressor 2 — Wood fuel\n")
+cat("Pays couverts :", n_distinct(pressions_s2$pays), "\n")
+cat("Années        :", paste(range(pressions_s2$annee), collapse = " - "), "\n")
+```
+
+## Statistiques par pays sur 1995-2022 — stressor 1
+
+```{r stats-s1}
+stats_s1 <- pressions_s1 %>%
+  group_by(pays) %>%
+  summarise(
+    moyenne = mean(extraction_s1, na.rm = TRUE),
+    min     = min(extraction_s1,  na.rm = TRUE),
+    max     = max(extraction_s1,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(moyenne))
+
+print(stats_s1, n = 30)
+```
+
+## Statistiques par pays sur 1995-2022 — stressor 2
+
+```{r stats-s2}
+stats_s2 <- pressions_s2 %>%
+  group_by(pays) %>%
+  summarise(
+    moyenne = mean(extraction_s2, na.rm = TRUE),
+    min     = min(extraction_s2,  na.rm = TRUE),
+    max     = max(extraction_s2,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(moyenne))
+
+print(stats_s2, n = 30)
+```
+
+# Section 2 — Comparaison des contributions des deux stressors
+
+## Table comparative et contribution relative
+
+```{r contributions-stressors}
+# fusion des deux stressors par pays/année
+pressions_2stressors <- pressions_s1 %>%
+  full_join(pressions_s2, by = c("pays", "annee")) %>%
+  mutate(
+    extraction_s1 = ifelse(is.na(extraction_s1), 0, extraction_s1),
+    extraction_s2 = ifelse(is.na(extraction_s2), 0, extraction_s2),
+    extraction_totale = extraction_s1 + extraction_s2,
+    pct_roundwood     = round(100 * extraction_s1 / extraction_totale, 1),
+    pct_woodfuel      = round(100 * extraction_s2 / extraction_totale, 1)
+  )
+
+# contribution moyenne par pays sur 1995-2022
+contribution_pays <- pressions_2stressors %>%
+  group_by(pays) %>%
+  summarise(
+    moy_roundwood = mean(extraction_s1, na.rm = TRUE),
+    moy_woodfuel  = mean(extraction_s2, na.rm = TRUE),
+    moy_totale    = mean(extraction_totale, na.rm = TRUE),
+    pct_roundwood = round(100 * moy_roundwood / moy_totale, 1),
+    pct_woodfuel  = round(100 * moy_woodfuel  / moy_totale, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(moy_totale))
+
+print(contribution_pays, n = 30)
+```
+
+## Graphique des contributions (barres empilées)
+
+```{r plot-contributions, fig.width=12, fig.height=6}
+library(tidyr)
+
+# on passe en format long pour ggplot
+contribution_long <- contribution_pays %>%
+  select(pays, moy_roundwood, moy_woodfuel) %>%
+  pivot_longer(
+    cols      = c(moy_roundwood, moy_woodfuel),
+    names_to  = "stressor",
+    values_to = "extraction"
+  ) %>%
+  mutate(stressor = recode(stressor,
+                           moy_roundwood = "Industrial roundwood",
+                           moy_woodfuel  = "Wood fuel"))
+
+# ordre des pays selon l'extraction totale décroissante
+ordre_pays <- contribution_pays$pays
+
+ggplot(contribution_long,
+       aes(x = factor(pays, levels = ordre_pays),
+           y = extraction,
+           fill = stressor)) +
+  geom_col() +
+  scale_fill_manual(values = c("Industrial roundwood" = "#2E7D32",
+                                "Wood fuel"            = "#A5D6A7")) +
+  labs(
+    title    = "Contribution des deux sources d'extraction à l'extraction forestière totale par pays",
+    subtitle = "Moyenne 1995-2022 — Source : EXIOBASE v3.10.2",
+    x        = NULL,
+    y        = "Extraction moyenne (kt)",
+    fill     = "Stressor"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+```
+
+# Section 3 — Agrégation : extraction forestière totale
+
+## Statistiques descriptives sur la variable agrégée
+
+```{r stats-totale}
+stats_totale <- pressions_2stressors %>%
+  group_by(pays) %>%
+  summarise(
+    extraction_moyenne = mean(extraction_totale, na.rm = TRUE),
+    extraction_min     = min(extraction_totale,  na.rm = TRUE),
+    extraction_max     = max(extraction_totale,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(extraction_moyenne)) %>%
+  mutate(rang = row_number()) %>%
+  select(rang, pays, extraction_moyenne, extraction_min, extraction_max)
+
+print(stats_totale, n = 30)
+```
+
+## Comparaison du classement avant/après agrégation
+
+```{r comparaison-rangs}
+# rang basé sur le stressor 1 seul
+rang_s1 <- stats_s1 %>%
+  mutate(rang_s1 = row_number()) %>%
+  select(pays, rang_s1)
+
+# rang basé sur l'agrégation des deux
+rang_totale <- stats_totale %>%
+  select(pays, rang_totale = rang)
+
+# fusion pour voir les déplacements de rang
+comparaison_rangs <- rang_s1 %>%
+  full_join(rang_totale, by = "pays") %>%
+  mutate(deplacement = rang_s1 - rang_totale) %>%
+  arrange(desc(abs(deplacement)))
+
+print(comparaison_rangs, n = 30)
+```
+
+# Section 4 — Séries temporelles 1995-2022
+
+## Évolution Europe entière de l'extraction totale
+
+```{r ts-europe-totale, fig.width=10, fig.height=5}
+evolution_europe_totale <- pressions_2stressors %>%
+  group_by(annee) %>%
+  summarise(
+    total_europe        = sum(extraction_totale, na.rm = TRUE),
+    roundwood_europe    = sum(extraction_s1, na.rm = TRUE),
+    woodfuel_europe     = sum(extraction_s2, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols      = c(roundwood_europe, woodfuel_europe, total_europe),
+    names_to  = "type",
+    values_to = "extraction"
+  ) %>%
+  mutate(type = recode(type,
+                       roundwood_europe = "Industrial roundwood",
+                       woodfuel_europe  = "Wood fuel",
+                       total_europe     = "Total (agrégé)"))
+
+ggplot(evolution_europe_totale,
+       aes(x = annee, y = extraction, color = type, linetype = type)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5) +
+  scale_color_manual(values = c("Industrial roundwood" = "#2E7D32",
+                                 "Wood fuel"            = "#A5D6A7",
+                                 "Total (agrégé)"       = "#1B5E20")) +
+  scale_linetype_manual(values = c("Industrial roundwood" = "solid",
+                                    "Wood fuel"            = "solid",
+                                    "Total (agrégé)"       = "dashed")) +
+  labs(
+    title    = "Évolution de l'extraction forestière en Europe (1995-2022)",
+    subtitle = "Somme des 27 pays ESGAP — décomposition par stressor",
+    x        = NULL,
+    y        = "Extraction (Mt)",
+    color    = NULL,
+    linetype = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+## Heatmap pays × année — extraction totale
+
+```{r heatmap-totale, fig.width=13, fig.height=8}
+# on classe les pays par extraction moyenne décroissante
+ordre_pays_totale <- stats_totale$pays
+
+heatmap_totale <- pressions_2stressors %>%
+  mutate(pays = factor(pays, levels = rev(ordre_pays_totale)))
+
+ggplot(heatmap_totale, aes(x = annee, y = pays, fill = extraction_totale / 1e6)) +
+  geom_tile(color = "white", linewidth = 0.2) +
+  scale_fill_gradientn(
+    colors = c("#1A9850", "#A6D96A", "#FFFFBF", "#FDAE61", "#D73027", "#7F0000"),
+    trans  = "log10",
+    name   = "Extraction\ntotale (kt, log10)"
+  ) +
+  scale_x_continuous(breaks = seq(1995, 2022, by = 3), expand = c(0, 0)) +
+  labs(
+    title    = "Évolution de l'extraction forestière totale par pays (1995-2022)",
+    subtitle = "Stressors agrégés : Industrial roundwood + Wood fuel",
+    x        = "Année",
+    y        = NULL,
+    caption  = "Échelle de couleur logarithmique. Vert = faible extraction | Rouge = forte extraction"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.y     = element_text(size = 9, face = "bold"),
+    axis.text.x     = element_text(size = 9),
+    panel.grid      = element_blank(),
+    legend.position = "right"
+  )
+```
