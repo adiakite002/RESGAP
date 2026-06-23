@@ -1740,3 +1740,103 @@ stats_intensite <- extraction_avec_surface %>%
 
 print(stats_intensite, n = 30)
 ```
+ 
+```{r}
+# volume total d'extraction cumulée par pays sur la période 1995-2022
+# Pour chaque pays, on additionne les 28 valeurs annuelles d'extraction totale
+# (roundwood + wood fuel agrégés)
+extr_total_pays <- pressions_2stressors %>%
+  group_by(pays) %>%
+  summarise(
+    extr_total_kt = sum(extraction_totale, na.rm = TRUE),
+    nb_annees      = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc( extr_total_kt)) %>%
+  mutate(rang = row_number()) %>%
+  select(rang, pays,  extr_total_kt, nb_annees)
+
+print(extr_total_pays, n = 30)
+```
+```{r}
+library(ggplot2)
+
+# Préparation : ordonner les pays par volume décroissant
+extr_total_pays <- extr_total_pays %>%
+mutate(pays = factor(pays, levels = rev(pays)))  # rev pour avoir le top en haut
+```
+
+```{r}
+ggplot(extr_total_pays, aes(x = extr_total_kt, y = pays)) +
+  geom_col(aes(fill = extr_total_kt), show.legend = FALSE) +
+  geom_text(aes(label = round(extr_total_kt, 2)),
+            hjust = -0.1, size = 3.2) +
+  scale_fill_gradientn(
+    colors = c("#A6D96A", "#FFFFBF", "#FDAE61", "#D73027")
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title    = "Ind. 01 Volume cumulé d'extraction forestière par pays (1995-2022)",
+    subtitle = "Somme des extractions annuelles : Industrial roundwood + Wood fuel",
+    x        = "Volume cumulé (Mt)",
+    y        = NULL,
+    caption  = "Source : EXIOBASE v3.10.2 — 27 pays ESGAP — période de 28 années"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    plot.subtitle    = element_text(size = 10, color = "#555555"),
+    axis.text.y      = element_text(size = 10, face = "bold"),
+    panel.grid.major.y = element_blank()
+  )
+
+ggsave(filename = "ind01_volume_cumule_barres.png", width = 10, height = 9, dpi = 300)
+
+
+```
+```{r}
+# Étape 1 — calculer les parts (pourcentages) si pas déjà fait
+extr_total_pays_pct <- extr_total_pays %>%
+  ungroup() %>%
+  mutate(
+    pays = as.character(pays),
+    pct  = round(100 * extr_total_kt / sum(extr_total_kt), 1)
+  ) %>%
+  arrange(desc(extr_total_kt)) %>%
+  mutate(pays = factor(pays, levels = pays))
+
+# Étape 2 — calculer le cumulatif décroissant
+extr_cumule <- extr_total_pays_pct %>%
+  arrange(desc(extr_total_kt)) %>%
+  mutate(
+    rang    = row_number(),
+    pct_cum = cumsum(pct)
+  )
+
+# Étape 3 — graphique de concentration
+ggplot(extr_cumule, aes(x = rang, y = pct_cum)) +
+  geom_line(linewidth = 1.2, color = "#1B5E20") +
+  geom_point(size = 2.5, color = "#1B5E20") +
+  geom_hline(yintercept = c(50, 80, 90), linetype = "dashed",
+             color = "#666666") +
+  annotate("text", x = 27, y = 52, label = "50%", hjust = 1, size = 3, color = "#666666") +
+  annotate("text", x = 27, y = 82, label = "80%", hjust = 1, size = 3, color = "#666666") +
+  annotate("text", x = 27, y = 92, label = "90%", hjust = 1, size = 3, color = "#666666") +
+  geom_text(aes(label = pays), vjust = -0.8, size = 2.8) +
+  scale_x_continuous(breaks = 1:27) +
+  scale_y_continuous(limits = c(0, 105), breaks = seq(0, 100, 25)) +
+  labs(
+    title    = "Ind. 01 Concentration de l'extraction forestière européenne",
+    subtitle = "Cumulatif et décroissant indique combien de pays expliquent X% du volume total extrait ?",
+    x        = "Nombre de pays cumulés (du plus gros au plus petit producteur)",
+    y        = "Part cumulée du volume total Europe (%)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 12),
+    plot.subtitle = element_text(size = 10, color = "#555555")
+  )
+
+ggsave("ind01_concentration.png", width = 12, height = 7, dpi = 300)
+```
+
