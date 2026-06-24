@@ -2204,3 +2204,203 @@ ggplot(heatmap_intensite, aes(x = annee, y = pays, fill = intensite_exploitfores
 ggsave("heatmap_ind01_intensite_biophysique.png",
        width = 13, height = 8, dpi = 300)
 ```
+```{r}
+# Objectif : extraire l'intensité biophysique pour l'année 2019
+# et classer les 27 pays
+
+intensite_2019 <- extraction_avec_surface %>%
+  filter(annee == 2019) %>%
+  select(pays, extraction_totale, surface_km2, intensite_exploitforestiere) %>%
+  arrange(desc(intensite_exploitforestiere)) %>%
+  mutate(
+    rang             = row_number(),
+    extraction_kt    = round(extraction_totale, 1),
+    surface_km2      = round(surface_km2, 0),
+    intensite_t_km2  = round(intensite_exploitforestiere, 1)
+  ) %>%
+  select(rang, pays, extraction_kt, surface_km2, intensite_t_km2)
+
+print(intensite_2019, n = 27)
+```
+```{r}
+ 
+# Vérification : extraction totale pour CY en 2019
+# on remonte aux deux stressors séparés pour voir la décomposition
+
+# stressor 1 : Industrial roundwood
+pressions_s1 %>%
+  filter(pays == "CY", annee == 2019)
+
+# stressor 2 : Wood fuel
+pressions_s2 %>%
+  filter(pays == "CY", annee == 2019)
+
+# total agrégé dans pressions_2stressors
+pressions_2stressors %>%
+  filter(pays == "CY", annee == 2019) %>%
+  select(pays, annee, extraction_s1, extraction_s2, extraction_totale)
+```
+```{r verif-intensite-2019-vs-moy}
+# Comparaison rang moyen 1995-2022 vs rang 2019 pour BE, CZ, NL
+extraction_avec_surface %>%
+  filter(pays %in% c("BE", "CZ", "NL")) %>%
+  group_by(pays) %>%
+  summarise(
+    intensite_moy_1995_2022 = round(mean(intensite_exploitforestiere, na.rm = TRUE), 1),
+    intensite_2019           = round(intensite_exploitforestiere[annee == 2019], 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(intensite_moy_1995_2022))
+```
+```{r}
+# total agrégé dans pressions_2stressors
+pressions_2stressors %>%
+  filter(pays == "BE", annee == 2019) %>%
+  select(pays, annee, extraction_s1, extraction_s2, extraction_totale)
+```
+```{r timeseries-intensite-par-pays, fig.show='hide'}
+# Objectif : générer 27 graphiques individuels, un par pays
+# Une seule courbe : intensité biophysique (t/km²) sur 1995-2022
+# Sauvegarde : Ind01_timeseries_intensite_XX.png
+
+library(ggplot2)
+library(dplyr)
+
+pays_liste <- unique(extraction_avec_surface$pays)
+
+for (p in pays_liste) {
+  
+  df_p <- extraction_avec_surface %>%
+    filter(pays == p) %>%
+    arrange(annee)
+  
+  g <- ggplot(df_p, aes(x = annee, y = intensite_exploitforestiere)) +
+    geom_line(colour = "#D73027", linewidth = 0.9) +
+    geom_point(colour = "#D73027", size = 1.8) +
+    scale_x_continuous(breaks = seq(1995, 2022, by = 3)) +
+    scale_y_continuous(labels = scales::comma) +
+    labs(
+      title    = paste0("Ind. 01 — ", p,
+                        " — Intensité biophysique d'exploitation forestière (1995–2022)"),
+      subtitle = "Intensité = extraction totale (S1+S2, tonnes) / surface forestière (km²)",
+      x        = "Année",
+      y        = "Intensité (t/km²)",
+      caption  = "Source : EXIOBASE v3.10.2 + Banque Mondiale"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 12),
+      plot.subtitle = element_text(size = 9, colour = "black"),
+      axis.text.x   = element_text(size = 8, angle = 45, hjust = 1),
+      panel.grid.minor = element_blank()
+    )
+  
+  ggsave(
+    filename = paste0("Ind01_timeseries_intensite_", p, ".png"),
+    plot     = g,
+    width    = 10,
+    height   = 5,
+    dpi      = 300
+  )
+  
+  cat("Sauvegardé :", paste0("Ind01_timeseries_intensite_", p, ".png"), "\n")
+}
+```
+```{r timeseries-intensite-tous-pays, fig.width=16, fig.height=20}
+# Objectif : tous les 27 pays sur un seul fichier via facet_wrap
+# Une courbe par pays : intensité biophysique (t/km²) sur 1995-2022
+
+ggplot(extraction_avec_surface, aes(x = annee, y = intensite_exploitforestiere)) +
+  geom_line(colour = "#D73027", linewidth = 0.7) +
+  geom_point(colour = "#D73027", size = 1.2) +
+  facet_wrap(~ pays, ncol = 4, scales = "free_y") +
+  scale_x_continuous(breaks = seq(1995, 2022, by = 6)) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = "Ind. 01 — Intensité biophysique d'exploitation forestière — 27 pays ESGAP (1995–2022)",
+    subtitle = "Intensité = extraction totale (S1+S2, tonnes) / surface forestière (km²) | Source : EXIOBASE v3.10.2 + Banque Mondiale",
+    x        = "Année",
+    y        = "Intensité (t/km²)"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    strip.text       = element_text(face = "bold", size = 10),
+    axis.text.x      = element_text(size = 7, angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave(
+  filename = "Ind01_timeseries_intensite_27pays.png",
+  width    = 16,
+  height   = 20,
+  dpi      = 300
+)
+```
+
+```{r timeseries-intensite-top10, fig.width=14, fig.height=12}
+# Objectif : Top 10 pays par intensité moyenne sur un seul fichier
+
+top10_pays <- extraction_avec_surface %>%
+  group_by(pays) %>%
+  summarise(intensite_moy = mean(intensite_exploitforestiere, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(desc(intensite_moy)) %>%
+  slice_head(n = 10) %>%
+  pull(pays)
+
+extraction_avec_surface %>%
+  filter(pays %in% top10_pays) %>%
+  mutate(pays = factor(pays, levels = top10_pays)) %>%
+  ggplot(aes(x = annee, y = intensite_exploitforestiere)) +
+  geom_line(colour = "#D73027", linewidth = 0.9) +
+  geom_point(colour = "#D73027", size = 1.8) +
+  facet_wrap(~ pays, ncol = 2, scales = "free_y") +
+  scale_x_continuous(breaks = seq(1995, 2022, by = 3)) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = "Ind. 01 — Top 10 pays — Intensité biophysique d'exploitation forestière (1995–2022)",
+    subtitle = "Pays classés par intensité moyenne décroissante | Source : EXIOBASE v3.10.2 + Banque Mondiale",
+    x        = "Année",
+    y        = "Intensité (t/km²)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    strip.text       = element_text(face = "bold", size = 11),
+    axis.text.x      = element_text(size = 8, angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave(
+  filename = "Ind01_timeseries_intensite_top10.png",
+  width    = 14,
+  height   = 12,
+  dpi      = 300
+)
+```
+```{r tendance-intensite-2010-2015}
+# Objectif : calculer la variation de l'intensité biophysique
+# entre 2010 et 2015 par pays (même fenêtre que le SESPI So_Fo)
+
+tendance_intensite <- extraction_avec_surface %>%
+  filter(annee %in% c(2010, 2015)) %>%
+  select(pays, annee, intensite_exploitforestiere) %>%
+  pivot_wider(names_from  = annee,
+              values_from = intensite_exploitforestiere,
+              names_prefix = "intensite_") %>%
+  mutate(
+    variation_absolue = intensite_2015 - intensite_2010,
+    variation_pct     = round(100 * (intensite_2015 - intensite_2010) / intensite_2010, 1),
+    direction         = case_when(
+      variation_pct >  5 ~ "↑ Hausse",
+      variation_pct < -5 ~ "↓ Baisse",
+      TRUE               ~ "→ Stable"
+    )
+  ) %>%
+  arrange(desc(variation_pct))
+
+print(tendance_intensite, n = 27)
+``` 
