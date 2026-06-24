@@ -1446,7 +1446,7 @@ ggplot(evolution_europe_totale,
                                     "Total (agrégé)"       = "dashed")) +
   labs(
     title    = "Évolution de l'extraction forestière en Europe (1995-2022)",
-    subtitle = "Somme des 27 pays ESGAP — décomposition par stressor",
+    subtitle = "Somme des 27 pays ESGAP-décomposition par stressor",
     x        = NULL,
     y        = "Extraction (Mt)",
     color    = NULL,
@@ -1795,7 +1795,7 @@ ggsave(filename = "ind01_volume_cumule_barres.png", width = 10, height = 9, dpi 
 
 ```
 ```{r}
-# Étape 1 — calculer les parts (pourcentages) si pas déjà fait
+# Étape 1 — calculer les parts (pourcentages)  
 extr_total_pays_pct <- extr_total_pays %>%
   ungroup() %>%
   mutate(
@@ -1840,3 +1840,367 @@ ggplot(extr_cumule, aes(x = rang, y = pct_cum)) +
 ggsave("ind01_concentration.png", width = 12, height = 7, dpi = 300)
 ```
 
+```{r}
+mapping_ind01 %>%
+  summarise(across(
+    where(is.numeric),
+    list(
+      moyenne = ~mean(.x, na.rm = TRUE),
+      mediane = ~median(.x, na.rm = TRUE),
+      ecart_type = ~sd(.x, na.rm = TRUE),
+      min = ~min(.x, na.rm = TRUE),
+      max = ~max(.x, na.rm = TRUE)
+    )
+  ))
+```
+
+## Analyse complémentaire 1 — Heatmap des intensités biophysiques (t/km²)
+
+```{r heatmap-intensite-setup}
+# Objectif : visualiser l'intensité biophysique (t/km²) pour tous les pays
+# sur toute la période 1995-2022 sous forme de heatmap.
+# On part de extraction_avec_surface qui contient déjà l'intensité calculée.
+
+library(ggplot2)
+library(dplyr)
+library(forcats)   # pour reordonner les facteurs
+library(scales)    # pour les labels d'axes
+
+# noms complets des pays pour l'axe Y
+noms_pays <- c(
+  AT="Autriche", BE="Belgique", BG="Bulgarie", HR="Croatie",
+  CY="Chypre",   CZ="R. Tchèque", DK="Danemark", EE="Estonie",
+  FI="Finlande", FR="France",   DE="Allemagne", GR="Grèce",
+  HU="Hongrie",  IE="Irlande",  IT="Italie",   LV="Lettonie",
+  LT="Lituanie", LU="Luxembourg", NL="Pays-Bas", PL="Pologne",
+  PT="Portugal", RO="Roumanie",  SK="Slovaquie", SI="Slovénie",
+  ES="Espagne",  SE="Suède",    GB="Royaume-Uni"
+)
+```
+
+```{r heatmap-intensite-prep}
+# Calcul de l'intensité moyenne par pays (sert à trier l'axe Y)
+ordre_pays <- extraction_avec_surface %>%
+  group_by(pays) %>%
+  summarise(intensite_moy = mean(intensite_exploitforestiere, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(desc(intensite_moy)) %>%
+  pull(pays)
+
+# Ajout du nom complet + tri de l'axe Y par intensité moy décroissante
+df_heatmap <- extraction_avec_surface %>%
+  mutate(
+    pays_label = paste0(pays, " — ", noms_pays[pays]),
+    pays_label = factor(pays_label,
+                        levels = paste0(ordre_pays, " — ", noms_pays[ordre_pays]))
+  )
+
+cat("Aperçu des données heatmap :\n")
+cat("Pays :", n_distinct(df_heatmap$pays), "\n")
+cat("Années :", paste(range(df_heatmap$annee), collapse = " – "), "\n")
+cat("Intensité min :", round(min(df_heatmap$intensite_exploitforestiere, na.rm=TRUE), 1), "t/km²\n")
+cat("Intensité max :", round(max(df_heatmap$intensite_exploitforestiere, na.rm=TRUE), 1), "t/km²\n")
+```
+
+```{r heatmap-intensite-plot, fig.width=14, fig.height=9}
+# Seuils pour la palette : on plafonne à 500 t/km² pour ne pas écraser
+# les pays médians (BE dépasse 650 certaines années)
+seuil_haut <- 500
+
+df_heatmap_plot <- df_heatmap %>%
+  mutate(intensite_plot = pmin(intensite_exploitforestiere, seuil_haut))
+
+ggplot(df_heatmap_plot, aes(x = annee, y = pays_label, fill = intensite_plot)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  scale_fill_gradientn(
+    colours = c("#006837", "#78C679", "#FFFFBF", "#FD8D3C", "#BD0026"),
+    values  = scales::rescale(c(0, 100, 200, 350, 500)),
+    limits  = c(0, seuil_haut),
+    oob     = scales::squish,
+    name    = "Intensité\n(t/km²)",
+    labels  = function(x) paste0(x, ifelse(x == seuil_haut, "+", ""))
+  ) +
+  scale_x_continuous(
+    breaks = seq(1995, 2022, by = 3),
+    expand = c(0, 0)
+  ) +
+  labs(
+    title    = "Intensités biophysiques d'exploitation forestière — 27 pays ESGAP (1995–2022)",
+    subtitle = "Intensité = extraction totale (S1+S2, tonnes) / surface forestière (km²) | Source : EXIOBASE + Banque Mondiale",
+    x        = NULL,
+    y        = NULL,
+    caption  = "Pays triés par intensité moyenne décroissante. Belgique = seul cas critique ESGAP (score ≈ 0)."
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 13),
+    plot.subtitle   = element_text(size = 9, colour = "grey40"),
+    axis.text.y     = element_text(size = 9),
+    axis.text.x     = element_text(size = 9, angle = 45, hjust = 1),
+    legend.position = "right",
+    panel.grid      = element_blank(),
+    plot.caption    = element_text(size = 8, colour = "grey50")
+  )
+```
+
+```{r heatmap-intensite-obs}
+# Observations clés à lire sur la heatmap
+cat("=== OBSERVATIONS ===\n\n")
+
+# Top 3 pays les plus intenses
+top3 <- extraction_avec_surface %>%
+  group_by(pays) %>%
+  summarise(moy = mean(intensite_exploitforestiere, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(moy)) %>%
+  slice_head(n = 3)
+cat("→ Top 3 intensité moy 1995-2022 :\n")
+print(top3)
+
+# Belgique : valeur max atteinte
+be_max <- extraction_avec_surface %>%
+  filter(pays == "BE") %>%
+  slice_max(intensite_exploitforestiere, n = 1)
+cat("\n→ Belgique — intensité maximale :", round(be_max$intensite_exploitforestiere, 0),
+    "t/km² en", be_max$annee, "\n")
+
+# Suède : intensité moy vs rang
+se_moy <- extraction_avec_surface %>%
+  filter(pays == "SE") %>%
+  summarise(moy = mean(intensite_exploitforestiere, na.rm = TRUE))
+cat("→ Suède — intensité moy :", round(se_moy$moy, 0),
+    "t/km² → rang 22/27 (peu intense malgré gros volumes) \n")
+```
+```{r heatmap-intensite-biophysique, fig.width=10, fig.height=5}
+# Objectif : même heatmap que pour l'extraction volume,
+# mais on remplace extraction_totale par l'intensité biophysique (t/km²)
+# Tout le reste (ordre pays, style, codes ISO2 sur l'axe Y) reste identique
+
+# on classe les pays par intensité moyenne décroissante
+ordre_pays_intensite <- extraction_avec_surface %>%
+  group_by(pays) %>%
+  summarise(intensite_moy = mean(intensite_exploitforestiere, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(desc(intensite_moy)) %>%
+  pull(pays)
+
+# préparation du dataframe avec le tri
+heatmap_intensite <- extraction_avec_surface %>%
+  mutate(pays = factor(pays, levels = rev(ordre_pays_intensite)))
+
+# heatmap
+ggplot(heatmap_intensite, aes(x = annee, y = pays, fill = intensite_exploitforestiere)) +
+  geom_tile(color = "white", linewidth = 0.2) +
+  scale_fill_gradientn(
+    colors = c("#1A9850", "#A6D96A", "#FFFFBF", "#FDAE61", "#D73027", "#7F0000"),
+    trans  = "log10",
+    name   = "Intensité\n(t/km², log10)"
+  ) +
+  scale_x_continuous(breaks = seq(1995, 2022, by = 3), expand = c(0, 0)) +
+  labs(
+    title    = "Évolution de l'intensité biophysique d'exploitation forestière par pays (1995-2022)",
+    subtitle = "Intensité = extraction totale (S1+S2, tonnes) / surface forestière (km²) | Source : EXIOBASE + Banque Mondiale",
+    x        = "Année",
+    y        = NULL,
+    caption  = "Échelle de couleur logarithmique. Vert = faible intensité | Rouge = forte intensité. Pays triés par intensité moyenne décroissante."
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.y     = element_text(size = 9, face = "bold"),
+    axis.text.x     = element_text(size = 9),
+    panel.grid      = element_blank(),
+    legend.position = "right"
+  )
+
+ggsave(
+  filename = "Évolution de l'intensité biophysique d'exploitation forestière par pays (1995-2022).png",
+  width    = 10,
+  height   = 5,
+  dpi      = 300
+)
+```
+
+```{r heatmap-intensite-prep}
+# on classe les pays par intensité moyenne décroissante
+ordre_pays_intensite <- extraction_avec_surface %>%
+  group_by(pays) %>%
+  summarise(intensite_moy = mean(intensite_exploitforestiere, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(desc(intensite_moy)) %>%
+  pull(pays)
+
+# tri des pays sur l'axe Y
+heatmap_intensite <- extraction_avec_surface %>%
+  mutate(pays = factor(pays, levels = rev(ordre_pays_intensite)))
+```
+
+```{r heatmap-intensite-v1, fig.width=14, fig.height=9}
+# VERSION 1 : palette plafonnée à 500 t/km²
+# permet de mieux distinguer les pays médians sans que BE écrase tout
+seuil_haut <- 500
+
+heatmap_intensite %>%
+  mutate(intensite_plot = pmin(intensite_exploitforestiere, seuil_haut)) %>%
+  ggplot(aes(x = annee, y = pays, fill = intensite_plot)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  scale_fill_gradientn(
+    colours = c("#006837", "#78C679", "#FFFFBF", "#FD8D3C", "#BD0026"),
+    values  = scales::rescale(c(0, 100, 200, 350, 500)),
+    limits  = c(0, seuil_haut),
+    oob     = scales::squish,
+    name    = "Intensité\n(t/km²)",
+    labels  = function(x) paste0(x, ifelse(x == seuil_haut, "+", ""))
+  ) +
+  scale_x_continuous(breaks = seq(1995, 2022, by = 3), expand = c(0, 0)) +
+  labs(
+    title    = "Intensités biophysiques d'exploitation forestière — 27 pays ESGAP (1995–2022)",
+    subtitle = "Intensité = extraction totale (S1+S2, tonnes) / surface forestière (km²) | Source : EXIOBASE + Banque Mondiale",
+    x        = "Année",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 13),
+    plot.subtitle   = element_text(size = 9, colour = "black"),
+    axis.text.y     = element_text(size = 9, face = "bold"),
+    axis.text.x     = element_text(size = 9, hjust = 1),
+    legend.position = "right",
+    panel.grid      = element_blank()
+  )
+
+ggsave(
+  filename = "heatmap_intensite_v1_plafond500.png",
+  width    = 10,
+  height   = 5,
+  dpi      = 300
+)
+```
+
+```{r heatmap-intensite-v2, fig.width=14, fig.height=9}
+# VERSION 2 : valeurs brutes complètes, pas de plafond
+# permet de voir l'étendue réelle (BE dépasse 650 t/km² certaines années)
+heatmap_intensite %>%
+  ggplot(aes(x = annee, y = pays, fill = intensite_exploitforestiere)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  scale_fill_gradientn(
+    colours = c("#006837", "#78C679", "#FFFFBF", "#FD8D3C", "#BD0026"),
+    name    = "Intensité\n(t/km²)"
+  ) +
+  scale_x_continuous(breaks = seq(1995, 2022, by = 3), expand = c(0, 0)) +
+  labs(
+    title    = "Intensités biophysiques d'exploitation forestière 27 pays (1995–2022)",
+    subtitle = "Intensité = extraction totale (t) / surface forestière (km²)",
+    x        = "Année",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 13),
+    plot.subtitle   = element_text(size = 9, colour = "black"),
+    axis.text.y     = element_text(size = 9, face = "bold"),
+    axis.text.x     = element_text(size = 9, angle = 45, hjust = 1),
+    legend.position = "right",
+    panel.grid      = element_blank()
+  )
+
+ggsave(
+  filename = "heatmap_intensite_v2_brute.png",
+  width    = 10,
+  height   = 5,
+  dpi      = 300
+)
+```
+```{r}
+# =============================================================================
+# Heatmap pays x année — Intensité biophysique d'extraction (1995-2022)
+# 
+# On reprend la même structure que le heatmap des extractions brutes
+# mais on remplace les valeurs en kt par l'intensité biophysique (t/km²)
+# Cela permet de voir comment la PRESSION RELATIVE par km² de forêt
+# a évolué dans le temps pour chaque pays
+# =============================================================================
+
+library(ggplot2)
+library(dplyr)
+
+# on classe les pays par intensité biophysique moyenne décroissante
+# pour avoir les pays les plus intensifs en haut du heatmap
+ordre_pays_intensite <- stats_intensite %>%
+  arrange(desc(intensite_moyenne)) %>%
+  pull(pays)
+
+# préparation des données avec pays comme facteur ordonné
+heatmap_intensite <- extraction_avec_surface %>%
+  mutate(pays = factor(pays, levels = rev(ordre_pays_intensite)))  # rev pour avoir top en haut
+
+# heatmap avec palette rouge (forte intensité) -> vert (faible intensité)
+ggplot(heatmap_intensite, aes(x = annee, y = pays, fill = intensite_biophysique)) +
+  geom_tile(color = "white", linewidth = 0.2) +
+  scale_fill_gradientn(
+    colors = c("#1A9850", "#A6D96A", "#FFFFBF", "#FDAE61", "#D73027", "#7F0000"),
+    trans  = "log10",
+    name   = "Intensité\n(t/km², log10)"
+  ) +
+  scale_x_continuous(breaks = seq(1995, 2022, by = 3), expand = c(0, 0)) +
+  labs(
+    title    = "Ind. 01 — Évolution de l'intensité biophysique d'extraction forestière (1995-2022)",
+    subtitle = "Source : EXIOBASE v3.10.2 + Banque mondiale — Pays classés par intensité moyenne décroissante",
+    x        = "Année",
+    y        = NULL,
+    caption  = "Vert = faible intensité | Rouge = forte intensité | Échelle log10 pour gérer les écarts entre pays"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.y      = element_text(size = 9, face = "bold"),
+    axis.text.x      = element_text(size = 9),
+    panel.grid       = element_blank(),
+    legend.position  = "right",
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 10, color = "#555555"),
+    plot.caption     = element_text(size = 8, color = "#777777", hjust = 0)
+  )
+
+ggsave("heatmap_ind01_intensite_biophysique.png",
+       width = 13, height = 8, dpi = 300)
+```
+```{r}
+# heatmap d'intensité biophysique — avec le bon nom de colonne
+
+# on classe les pays par intensité moyenne décroissante
+ordre_pays_intensite <- stats_intensite %>%
+  arrange(desc(intensite_moyenne)) %>%
+  pull(pays)
+
+# préparation des données avec pays comme facteur ordonné
+heatmap_intensite <- extraction_avec_surface %>%
+  mutate(pays = factor(pays, levels = rev(ordre_pays_intensite)))
+
+# heatmap en échelle linéaire (les écarts sont raisonnables, pas besoin de log)
+ggplot(heatmap_intensite, aes(x = annee, y = pays, fill = intensite_exploitforestiere)) +
+  geom_tile(color = "white", linewidth = 0.2) +
+  scale_fill_gradientn(
+    colors = c("#1A9850", "#A6D96A", "#FFFFBF", "#FDAE61", "#D73027", "#7F0000"),
+    trans  = "log10",
+    name   = "Intensité\n(t/km²)"
+  ) +
+  scale_x_continuous(breaks = seq(1995, 2022, by = 3), expand = c(0, 0)) +
+  labs(
+    title    = "Ind. 01 Évolution de l'intensité biophysique d'extraction forestière (1995-2022)",
+    subtitle = "Pays classés par intensité moyenne décroissante",
+    x        = "Année",
+    y        = NULL,
+    caption  = "Vert = faible intensité | Rouge = forte intensité - échelle logarithmique en tonnes par km²"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.y      = element_text(size = 9, face = "bold"),
+    axis.text.x      = element_text(size = 9),
+    panel.grid       = element_blank(),
+    legend.position  = "right",
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 10, color = "#555555"),
+    plot.caption     = element_text(size = 8, color = "#777777", hjust = 0)
+  )
+
+ggsave("heatmap_ind01_intensite_biophysique.png",
+       width = 13, height = 8, dpi = 300)
+```
