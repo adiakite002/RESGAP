@@ -92,6 +92,13 @@ forest_area <- s3read_using(
   bucket = "projet-esteem",
   opts   = list("region" = "")
 )
+
+nai<- s3read_using(
+  FUN = readxl::read_excel,
+  object = "s3://projet-esteem/EXIOBASE/IncrementAndFellings-2026-06-22.xlsx" ,
+  bucket = "projet-esteem",
+  opts = list("region" = "")
+  )
 ```
 
 
@@ -2381,10 +2388,8 @@ ggsave(
   dpi      = 300
 )
 ```
-```{r tendance-intensite-2010-2015}
-# Objectif : calculer la variation de l'intensité biophysique
-# entre 2010 et 2015 par pays (même fenêtre que le SESPI So_Fo)
 
+```{r tendance-intensite-2010-2015}
 tendance_intensite <- extraction_avec_surface %>%
   filter(annee %in% c(2010, 2015)) %>%
   select(pays, annee, intensite_exploitforestiere) %>%
@@ -2395,12 +2400,817 @@ tendance_intensite <- extraction_avec_surface %>%
     variation_absolue = intensite_2015 - intensite_2010,
     variation_pct     = round(100 * (intensite_2015 - intensite_2010) / intensite_2010, 1),
     direction         = case_when(
-      variation_pct >  5 ~ "↑ Hausse",
-      variation_pct < -5 ~ "↓ Baisse",
-      TRUE               ~ "→ Stable"
+      variation_pct > 0 ~ "+",
+      variation_pct < 0 ~ "-",
+      TRUE              ~ "0"
     )
   ) %>%
   arrange(desc(variation_pct))
 
 print(tendance_intensite, n = 27)
-``` 
+```
+# =============================================================================
+# Section — Nettoyage et préparation des données NAI (Forest Europe)
+#
+# Objectif : transformer le dataframe `nai` (format large, noms de pays complets)
+# en format long avec codes ISO2, prêt pour le join avec pressions_2stressors.
+# Périmètre : 16 pays ESGAP avec données NAI disponibles (BE traité séparément).
+# =============================================================================
+```{r nai-nettoyage}
+# le dataframe nai a une structure brute issue du fichier Forest Europe :
+# - colonne ...1 = noms de pays
+# - ligne 1 = sous-titres (Net annual increment, etc.) → à supprimer
+# - colonnes NAI par position fixe (2, 7, 12, 17, 22)
+# - toutes les valeurs en chr → conversion numérique nécessaire
+
+# table ISO2 pour les 16 pays ESGAP avec données NAI (BE séparé)
+table_iso_nai <- data.frame(
+  pays_nom = c(
+    "Bulgaria", "Croatia", "Czechia", "Denmark", "Estonia",
+    "Finland", "Germany", "Hungary", "Ireland", "Latvia",
+    "Lithuania", "Netherlands (Kingdom of the)", "Romania",
+    "Slovakia", "Sweden",
+    "United Kingdom of Great Britain and Northern Ireland"
+  ),
+  pays = c(
+    "BG", "HR", "CZ", "DK", "EE",
+    "FI", "DE", "HU", "IE", "LV",
+    "LT", "NL", "RO",
+    "SK", "SE", "GB"
+  ),
+  stringsAsFactors = FALSE
+)
+
+# étape 1 : renommer les colonnes utiles et supprimer la ligne de sous-titres
+nai_clean <- nai %>%
+  rename(pays_nom = `...1`) %>%
+  # supprimer la ligne 1 qui contient les sous-titres
+  slice(-1) %>%
+  # extraire uniquement les colonnes NAI par position (col 2=2015, 7=2010, 12=2005, 17=2000, 22=1990)
+  select(
+    pays_nom,
+    NAI_2015 = 2,
+    NAI_2010 = 7,
+    NAI_2005 = 12,
+    NAI_2000 = 17,
+    NAI_1990 = 22
+  ) %>%
+  # conversion en numérique
+  mutate(across(-pays_nom, as.numeric))
+
+# étape 2 : filtrer sur les 16 pays ESGAP + ajouter code ISO2
+nai_filtre <- nai_clean %>%
+  filter(pays_nom %in% table_iso_nai$pays_nom) %>%
+  left_join(table_iso_nai, by = "pays_nom") %>%
+  select(pays, NAI_1990, NAI_2000, NAI_2005, NAI_2010, NAI_2015)
+
+cat("Pays retenus (hors BE) :", nrow(nai_filtre), "\n")
+print(nai_filtre)
+```
+
+```{r nai-interpolation-1995}
+# calcul NAI_1995 par interpolation linéaire entre 1990 et 2000
+# si NAI_1990 absent → on utilise NAI_2000 comme valeur 1995
+nai_filtre <- nai_filtre %>%
+  mutate(
+    NAI_1995 = case_when(
+      !is.na(NAI_1990) & !is.na(NAI_2000) ~
+        NAI_1990 + (NAI_2000 - NAI_1990) * (1995 - 1990) / (2000 - 1990),
+      is.na(NAI_1990) & !is.na(NAI_2000) ~ NAI_2000,
+      TRUE ~ NA_real_
+    )
+  )
+
+cat("NAI_1995 calculé pour :", sum(!is.na(nai_filtre$NAI_1995)), "pays\n")
+```
+
+```{r nai-format-long}
+# pivot long sur les 5 années de référence : pays | annee | NAI
+nai_long <- nai_filtre %>%
+  select(pays, NAI_1995, NAI_2000, NAI_2005, NAI_2010, NAI_2015) %>%
+  pivot_longer(
+    cols      = starts_with("NAI_"),
+    names_to  = "annee",
+    values_to = "NAI"
+  ) %>%
+  mutate(annee = as.integer(gsub("NAI_", "", annee))) %>%
+  # cas particulier LV 2005 : NA → interpolation entre 2000 et 2010
+  group_by(pays) %>%
+  arrange(annee) %>%
+  mutate(
+    NAI = ifelse(
+      is.na(NAI) & annee == 2005 & pays == "LV",
+      (NAI[annee == 2000] + NAI[annee == 2010]) / 2,
+      NAI
+    )
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(NAI))
+
+cat("Lignes dans nai_long :", nrow(nai_long), "\n")
+cat("Pays couverts        :", n_distinct(nai_long$pays), "\n")
+cat("Années disponibles   :", paste(sort(unique(nai_long$annee)), collapse = ", "), "\n")
+print(nai_long, n = 30)
+```
+
+```{r nai-belgique-separe}
+# BE : 1 seul point NAI disponible (2015) → traitement ponctuel séparé
+nai_be_2015 <- data.frame(
+  pays  = "BE",
+  annee = 2015L,
+  NAI   = 5510.43
+)
+
+cat("BE — NAI 2015 :", nai_be_2015$NAI, "(1 000 m³ over bark)\n")
+```
+# =============================================================================
+# Mission 1 — Time series extraction brute totale par pays (27 pays)
+#
+# Objectif : visualiser l'évolution de l'extraction forestière brute (S1+S2)
+# sur 1995-2022 pour les 27 pays en un seul graphique facetté.
+# =============================================================================
+
+```{r m1-timeseries-extraction}
+# palette et thème définis une fois pour toutes les missions
+palette_ind01 <- c("#1A9850", "#A6D96A", "#FFFFBF", "#FDAE61", "#D73027", "#7F0000")
+
+p_ts <- ggplot(
+    pressions_2stressors,
+    aes(x = annee, y = extraction_totale)
+  ) +
+  geom_line(colour = "#D73027", linewidth = 0.7) +
+  facet_wrap(~ pays, ncol = 4, scales = "free_y") +
+  labs(
+    title    = "Ind. 01 — Évolution de l'extraction forestière brute totale (S1+S2) par pays (1995–2022)",
+    subtitle = "Stressors agrégés : Industrial roundwood (S1) + Wood fuel (S2) | Source : EXIOBASE v3.10.2",
+    x        = NULL,
+    y        = "Extraction totale (kt)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    panel.grid.minor = element_blank(),
+    axis.text.y      = element_text(face = "bold"),
+    strip.text       = element_text(face = "bold")
+  )
+
+ggsave(
+  filename = "Ind01_timeseries_extraction_brute_27pays.png",
+  plot     = p_ts,
+  width    = 16,
+  height   = 20,
+  dpi      = 300
+)
+
+p_ts
+```
+
+# =============================================================================
+# Mission 2 — Corrélation EXIOBASE vs ESGAP
+#
+# Objectif : tester le lien linéaire entre intensité biophysique moyenne
+# (t/km²) et score SESI So_Fo par pays.
+# =============================================================================
+
+```{r m2-prep-correlation}
+# scores SESI So_Fo par pays (Usubiaga-Liaño & Ekins, 2021)
+scores_sofo <- c(
+  AT=43.05, BE=4.41,  BG=84.32, HR=94.89, CY=100.0,
+  CZ=52.99, DK=100.0, EE=56.93, FI=65.32, FR=100.0,
+  DE=78.40, GR=100.0, HU=100.0, IE=100.0, IT=100.0,
+  LV=100.0, LT=98.92, LU=100.0, NL=100.0, PL=46.22,
+  PT=44.96, RO=100.0, SK=70.47, SI=100.0, ES=100.0,
+  SE=20.45, GB=100.0
+)
+
+# intensité moyenne 1995-2022 par pays depuis extraction_avec_surface
+intensite_moy <- extraction_avec_surface %>%
+  group_by(pays) %>%
+  summarise(
+    intensite_moy_tkm2 = mean(intensite_exploitforestiere, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# jointure avec les scores SESI
+df_corr <- intensite_moy %>%
+  mutate(score_sofo = scores_sofo[pays]) %>%
+  filter(!is.na(score_sofo))
+
+cat("Pays dans la corrélation :", nrow(df_corr), "\n")
+```
+
+```{r m2-calcul-correlation}
+# corrélation de Pearson et R²
+cor_test  <- cor.test(df_corr$intensite_moy_tkm2, df_corr$score_sofo)
+r_pearson <- round(cor_test$estimate, 3)
+r2        <- round(cor_test$estimate^2, 3)
+p_val     <- round(cor_test$p.value, 4)
+
+cat("Corrélation de Pearson r :", r_pearson, "\n")
+cat("R²                       :", r2,        "\n")
+cat("p-value                  :", p_val,     "\n")
+```
+
+```{r m2-scatter-correlation}
+install.packages("ggrepel")
+library(ggrepel)
+
+# position annotation R² + p-value
+x_ann <- max(df_corr$intensite_moy_tkm2) * 0.55
+y_ann <- max(df_corr$score_sofo)  * 0.15
+
+p_corr <- ggplot(df_corr, aes(x = intensite_moy_tkm2, y = score_sofo)) +
+  geom_smooth(method = "lm", se = TRUE,
+              colour = "#4575B4", fill = "#ABD9E9", alpha = 0.3) +
+  geom_point(size = 3, colour = "#D73027") +
+  geom_text_repel(aes(label = pays), size = 3, fontface = "bold",
+                  max.overlaps = 20) +
+  annotate("text",
+           x     = x_ann,
+           y     = y_ann,
+           label = paste0("R² = ", r2, "\np = ", p_val),
+           size  = 3.5,
+           hjust = 0,
+           colour = "black") +
+  labs(
+    title    = "Ind. 01 — Corrélation intensité biophysique EXIOBASE vs score SESI So_Fo",
+    subtitle = "Source : EXIOBASE v3.10.2 + Banque Mondiale (intensité) | Usubiaga-Liaño & Ekins (2021) (SESI)",
+    x        = "Intensité biophysique moyenne (t/km²)",
+    y        = "Score SESI So_Fo (/100)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave(
+  filename = "Ind01_correlation_EXIOBASE_SESI.png",
+  plot     = p_corr,
+  width    = 10,
+  height   = 7,
+  dpi      = 300
+)
+
+p_corr
+```
+
+# =============================================================================
+# Mission 3 — Intensité NAI
+#
+# Objectif : calculer intensite_nai = (extraction_totale_kt × 1000) / NAI
+# pour les 16 pays avec données NAI, sur les 5 années de référence.
+# Comparer le classement NAI vs classement t/km².
+# =============================================================================
+
+```{r m3-join-nai}
+# filtrage de pressions_2stressors sur les 5 années de référence
+# et les 16 pays disponibles dans nai_long
+annees_nai <- c(1995, 2000, 2005, 2010, 2015)
+pays_nai   <- unique(nai_long$pays)
+
+pressions_nai <- pressions_2stressors %>%
+  filter(annee %in% annees_nai, pays %in% pays_nai) %>%
+  select(pays, annee, extraction_totale)
+
+# jointure avec nai_long
+df_nai <- pressions_nai %>%
+  inner_join(nai_long, by = c("pays", "annee")) %>%
+  mutate(
+    # formule : ratio brut, pas de conversion d'unité
+    # numérateur  : extraction en tonnes (kt × 1000)
+    # dénominateur : NAI en 1 000 m³ over bark tel quel
+    intensite_nai = (extraction_totale * 1000) / NAI
+  )
+
+cat("Lignes après jointure :", nrow(df_nai), "\n")
+cat("Pays couverts         :", n_distinct(df_nai$pays), "\n")
+```
+
+```{r m3-calcul-belgique}
+# Belgique : calcul ponctuel sur 2015 uniquement
+extraction_be_2015 <- pressions_2stressors %>%
+  filter(pays == "BE", annee == 2015) %>%
+  pull(extraction_totale)
+
+intensite_nai_be_2015 <- (extraction_be_2015 * 1000) / nai_be_2015$NAI
+
+cat("BE — extraction 2015 :", extraction_be_2015, "kt\n")
+cat("BE — NAI 2015        :", nai_be_2015$NAI,    "(1 000 m³)\n")
+cat("BE — intensite_nai   :", round(intensite_nai_be_2015, 3), "\n")
+```
+
+```{r m3-classement}
+# intensite_nai moyenne par pays sur les 5 points disponibles
+intensite_nai_moy <- df_nai %>%
+  group_by(pays) %>%
+  summarise(
+    intensite_nai_moy = mean(intensite_nai, na.rm = TRUE),
+    n_annees          = n(),
+    .groups = "drop"
+  )
+
+# rang t/km² pour les mêmes 16 pays (depuis stats_intensite)
+rang_tkm2 <- stats_intensite %>%
+  filter(pays %in% pays_nai) %>%
+  arrange(desc(intensite_moyenne)) %>%
+  mutate(rang_tkm2 = row_number()) %>%
+  select(pays, intensite_moyenne, rang_tkm2)
+
+# tableau de classement croisé
+classement_nai <- intensite_nai_moy %>%
+  arrange(desc(intensite_nai_moy)) %>%
+  mutate(rang_nai = row_number()) %>%
+  left_join(rang_tkm2, by = "pays") %>%
+  mutate(
+    deplacement_rang = rang_nai - rang_tkm2
+  ) %>%
+  select(rang_nai, pays, intensite_nai_moy, rang_tkm2,
+         intensite_moyenne, deplacement_rang)
+
+cat("\n--- Classement intensité NAI vs intensité t/km² ---\n")
+print(classement_nai, n = 17)
+
+# export CSV
+write.csv(classement_nai,
+          file      = "Ind01_classement_intensite_NAI.csv",
+          row.names = FALSE)
+cat("\nFichier exporté : Ind01_classement_intensite_NAI.csv\n")
+```
+
+# =============================================================================
+# Mission 4 — Cas typique Suède
+#
+# Objectif : expliquer le paradoxe SE (faible intensité EXIOBASE
+# mais mauvais score ESGAP) en 3 blocs.
+# =============================================================================
+
+```{r m4-bloc1-tableau-comparatif}
+# Bloc 1 : tableau comparatif SE, BE, DE, FI
+# intensité t/km², rang EXIOBASE, score SESI, rang ESGAP
+
+pays_focus <- c("SE", "BE", "DE", "FI")
+
+# rangs EXIOBASE parmi les 27 pays
+rangs_exio <- stats_intensite %>%
+  arrange(desc(intensite_moyenne)) %>%
+  mutate(rang_exio_27 = row_number()) %>%
+  filter(pays %in% pays_focus) %>%
+  select(pays, intensite_moyenne, rang_exio_27)
+
+# rangs ESGAP (score décroissant = meilleur rang)
+rangs_esgap <- data.frame(
+  pays       = names(scores_sofo),
+  score_sofo = unname(scores_sofo)
+) %>%
+  arrange(desc(score_sofo)) %>%
+  mutate(rang_esgap = row_number()) %>%
+  filter(pays %in% pays_focus) %>%
+  select(pays, score_sofo, rang_esgap)
+
+# tableau final
+tableau_comparatif <- rangs_exio %>%
+  left_join(rangs_esgap, by = "pays") %>%
+  arrange(match(pays, pays_focus))
+
+cat("\n--- Tableau comparatif SE / BE / DE / FI ---\n")
+cat("Intensité moy = t/km² moyenne 1995-2022\n")
+cat("Rang EXIOBASE = parmi 27 pays (1 = plus intensif)\n")
+cat("Rang ESGAP    = parmi 27 pays (1 = meilleur score)\n\n")
+print(tableau_comparatif)
+```
+```{r m4-bloc2-intensite-nai-se}
+# Bloc 2 : évolution de l'intensite_nai pour la Suède sur 5 points disponibles
+# → ratio brut : extraction totale (tonnes) / NAI (1 000 m³ over bark)
+# → SE n'a pas de données NAI avant 2005 → graphique commence à 2005
+
+se_nai <- df_nai %>%
+  filter(pays == "SE") %>%
+  arrange(annee)
+
+p_se_nai <- ggplot(se_nai, aes(x = annee, y = intensite_nai)) +
+  geom_col(fill = "#4575B4", alpha = 0.8, width = 3) +
+  geom_line(colour = "#D73027", linewidth = 1) +
+  geom_point(colour = "#D73027", size = 3) +
+  scale_x_continuous(breaks = c(2005, 2010, 2015)) +
+  labs(
+    title    = "Suède — Intensité NAI (extraction totale / NAI) sur 3 points de référence (2005–2015)",
+    subtitle = "Source : EXIOBASE v3.10.2 + Forest Europe",
+    x        = NULL,
+    y        = "Intensité NAI (extraction t / NAI 1 000 m³)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave(
+  filename = "Ind01_SE_intensite_NAI.png",
+  plot     = p_se_nai,
+  width    = 10,
+  height   = 6,
+  dpi      = 300
+)
+
+p_se_nai
+```
+
+```{r m4-bloc3-scatter-paradoxe}
+# Bloc 3 : scatter M2 avec SE et BE mis en évidence
+# annotation du paradoxe suédois
+
+df_corr_highlight <- df_corr %>%
+  mutate(
+    groupe = case_when(
+      pays == "SE" ~ "Suède (paradoxe)",
+      pays == "BE" ~ "Belgique (cas critique)",
+      TRUE         ~ "Autres pays"
+    )
+  )
+
+p_paradoxe <- ggplot(df_corr_highlight,
+                     aes(x = intensite_moy_tkm2, y = score_sofo)) +
+  geom_smooth(method = "lm", se = TRUE,
+              colour = "#4575B4", fill = "#ABD9E9", alpha = 0.3) +
+  geom_point(aes(colour = groupe, size = groupe)) +
+  geom_text_repel(aes(label = pays), size = 3, fontface = "bold",
+                  max.overlaps = 20) +
+  scale_colour_manual(
+    values = c(
+      "Suède (paradoxe)"       = "#D73027",
+      "Belgique (cas critique)"= "#7F0000",
+      "Autres pays"            = "#4575B4"
+    )
+  ) +
+  scale_size_manual(
+    values = c(
+      "Suède (paradoxe)"       = 5,
+      "Belgique (cas critique)"= 5,
+      "Autres pays"            = 3
+    )
+  ) +
+  annotate("text",
+           x      = df_corr$intensite_moy_tkm2[df_corr$pays == "SE"] + 5,
+           y      = df_corr$score_sofo[df_corr$pays == "SE"] + 8,
+           label  = "SE : faible intensité t/km²\nmais taux extraction/NAI élevé\n→ mauvais score ESGAP",
+           size   = 3,
+           hjust  = 0,
+           colour = "#D73027") +
+  labs(
+    title    = "Ind. 01 — Paradoxe Suède : faible intensité EXIOBASE mais mauvais score ESGAP",
+    subtitle = "Source : EXIOBASE v3.10.2 + Banque Mondiale (intensité) | Usubiaga-Liaño & Ekins (2021) (SESI)",
+    x        = "Intensité biophysique moyenne (t/km²)",
+    y        = "Score SESI So_Fo (/100)",
+    colour   = NULL,
+    size     = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  )
+
+ggsave(
+  filename = "Ind01_paradoxe_SE_scatter.png",
+  plot     = p_paradoxe,
+  width    = 10,
+  height   = 7,
+  dpi      = 300
+)
+
+p_paradoxe
+```
+```{r m3-heatmap-intensite-nai}
+# Objectif : visualiser l'intensite_nai par pays et par année (5 points)
+# sous forme de heatmap — plus c'est foncé, plus la pression est élevée
+
+# on ajoute BE 2015 au dataframe pour l'inclure dans la heatmap
+df_nai_complet <- df_nai %>%
+  select(pays, annee, intensite_nai) %>%
+  bind_rows(
+    data.frame(
+      pays          = "BE",
+      annee         = 2015L,
+      intensite_nai = intensite_nai_be_2015
+    )
+  )
+
+# ordre des pays : du plus intensif au moins intensif (moyenne sur points dispo)
+ordre_heatmap <- df_nai_complet %>%
+  group_by(pays) %>%
+  summarise(moy = mean(intensite_nai, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(moy)) %>%
+  pull(pays)
+
+p_heatmap_nai <- ggplot(
+    df_nai_complet,
+    aes(x = factor(annee), y = factor(pays, levels = rev(ordre_heatmap)),
+        fill = intensite_nai)
+  ) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(intensite_nai, 0)),
+            size = 3, colour = "black") +
+  scale_fill_gradientn(
+    colours = c("#1A9850", "#FFFFBF", "#FDAE61", "#D73027", "#7F0000"),
+    name    = "Intensité NAI\n(t / 1 000 m³)"
+  ) +
+  labs(
+    title    = "Ind. 01 Intensité NAI par pays et par année (extraction t / NAI 1 000 m³)",
+    subtitle = "Source : EXIOBASE v3.10.2 + Forest Europe | 17 pays disponibles | BE = 2015 uniquement",
+    x        = "Année",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    panel.grid.minor = element_blank(),
+    axis.text.y      = element_text(face = "bold"),
+    legend.position  = "right"
+  )
+
+ggsave(
+  filename = "Ind01_heatmap_intensite_NAI.png",
+  plot     = p_heatmap_nai,
+  width    = 10,
+  height   = 7,
+  dpi      = 300
+)
+
+p_heatmap_nai
+```
+```{r m3-timeseries-intensite-nai}
+# Objectif : visualiser l'évolution de l'intensite_nai sur les 5 points
+# disponibles pour chaque pays — facet_wrap comme la Mission 1
+# BE affiché avec un seul point (2015 uniquement)
+
+p_ts_nai <- ggplot(
+    df_nai_complet,
+    aes(x = annee, y = intensite_nai)
+  ) +
+  geom_line(colour = "#4575B4", linewidth = 0.7) +
+  geom_point(colour = "#D73027", size = 2.5) +
+  facet_wrap(~ factor(pays, levels = ordre_heatmap), ncol = 4, scales = "free_y") +
+  scale_x_continuous(breaks = c(1995, 2000, 2005, 2010, 2015)) +
+  labs(
+    title    = "Ind. 01 — Évolution de l'intensité NAI par pays (extraction t / NAI 1 000 m³)",
+    subtitle = "Source : EXIOBASE v3.10.2 + Forest Europe | 17 pays disponibles | BE = 2015 uniquement",
+    x        = NULL,
+    y        = "Intensité NAI (t / 1 000 m³)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    panel.grid.minor = element_blank(),
+    axis.text.y      = element_text(face = "bold"),
+    strip.text       = element_text(face = "bold"),
+    axis.text.x      = element_text(angle = 45, hjust = 1)
+  )
+
+ggsave(
+  filename = "Ind01_timeseries_intensite_NAI.png",
+  plot     = p_ts_nai,
+  width    = 14,
+  height   = 12,
+  dpi      = 300
+)
+
+p_ts_nai
+```
+```{r m3-timeseries-intensite-nai}
+# Objectif : visualiser l'intensite_nai par pays sur les points disponibles
+# barres par année — plus honnête que la ligne car données discontinues
+
+p_ts_nai <- ggplot(
+    df_nai_complet,
+    aes(x = factor(annee), y = intensite_nai)
+  ) +
+  geom_col(fill = "#4575B4", alpha = 0.8) +
+  facet_wrap(~ factor(pays, levels = ordre_heatmap), ncol = 4, scales = "free_y") +
+  labs(
+    title    = "Ind. 01 — Intensité NAI par pays et par année (extraction t / NAI 1 000 m³)",
+    subtitle = "Source : EXIOBASE v3.10.2 + Forest Europe | 17 pays disponibles | BE = 2015 uniquement",
+    x        = NULL,
+    y        = "Intensité NAI (t / 1 000 m³)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    panel.grid.minor = element_blank(),
+    axis.text.y      = element_text(face = "bold"),
+    strip.text       = element_text(face = "bold"),
+    axis.text.x      = element_text(angle = 45, hjust = 1)
+  )
+
+ggsave(
+  filename = "Ind01_évolution_intensite_NAI.png",
+  plot     = p_ts_nai,
+  width    = 14,
+  height   = 12,
+  dpi      = 300
+)
+
+p_ts_nai
+```
+```{r}
+df_nai_complet %>%
+  select(pays, annee, intensite_nai) %>%
+  arrange(pays, annee) %>%
+  print(n = 90)
+```
+```{r analyses-correlations-variation}
+# ============================================================
+# Analyse 1 — Deux corrélations : intensite_nai 2015 vs So_Fo et vs to.01
+# ============================================================
+
+# scores So_Fo (SESI) — déjà définis
+scores_sofo <- c(
+  AT=43.05, BE=4.41,  BG=84.32, HR=94.89, CY=100.0,
+  CZ=52.99, DK=100.0, EE=56.93, FI=65.32, FR=100.0,
+  DE=78.40, GR=100.0, HU=100.0, IE=100.0, IT=100.0,
+  LV=100.0, LT=98.92, LU=100.0, NL=100.0, PL=46.22,
+  PT=44.96, RO=100.0, SK=70.47, SI=100.0, ES=100.0,
+  SE=20.45, GB=100.0
+)
+
+# scores to.01 (SESPI forêts) extraits du fichier SM_ESGAP
+scores_to01 <- c(
+  AT=30.28, BE=10.32, BG=42.38, HR=44.96, CY=46.15,
+  CZ=33.60, DK=46.15, EE=34.82, FI=37.30, FR=46.15,
+  DE=40.87, GR=46.15, HU=46.15, IE=46.15, IT=46.15,
+  LV=46.15, LT=45.90, LU=46.15, NL=46.15, PL=31.38,
+  PT=30.95, RO=46.15, SK=38.75, SI=46.15, ES=46.15,
+  SE=20.87, GB=46.15
+)
+
+# extraire intensite_nai 2015 uniquement
+nai_2015 <- df_nai_complet %>%
+  filter(annee == 2015) %>%
+  select(pays, intensite_nai_2015 = intensite_nai)
+
+# jointure avec les deux scores
+df_corr_nai <- nai_2015 %>%
+  mutate(
+    score_sofo  = scores_sofo[pays],
+    score_to01  = scores_to01[pays]
+  ) %>%
+  filter(!is.na(score_sofo) & !is.na(score_to01))
+
+cat("Pays dans les corrélations :", nrow(df_corr_nai), "\n\n")
+
+# --- Corrélation A : intensite_nai 2015 vs So_Fo ---
+corA <- cor.test(df_corr_nai$intensite_nai_2015, df_corr_nai$score_sofo)
+cat("=== Corrélation A : intensite_nai 2015 vs So_Fo (SESI) ===\n")
+cat("r       :", round(corA$estimate, 3), "\n")
+cat("R²      :", round(corA$estimate^2, 3), "\n")
+cat("p-value :", round(corA$p.value, 4), "\n\n")
+
+# --- Corrélation B : intensite_nai 2015 vs to.01 ---
+corB <- cor.test(df_corr_nai$intensite_nai_2015, df_corr_nai$score_to01)
+cat("=== Corrélation B : intensite_nai 2015 vs to.01 (SESPI forêts) ===\n")
+cat("r       :", round(corB$estimate, 3), "\n")
+cat("R²      :", round(corB$estimate^2, 3), "\n")
+cat("p-value :", round(corB$p.value, 4), "\n\n")
+```
+
+```{r scatter-correlation-A}
+# scatter : intensite_nai 2015 vs So_Fo
+library(ggrepel)
+
+p_corrA <- ggplot(df_corr_nai, aes(x = intensite_nai_2015, y = score_sofo)) +
+  geom_smooth(method = "lm", se = TRUE,
+              colour = "#4575B4", fill = "#ABD9E9", alpha = 0.3) +
+  geom_point(aes(colour = pays %in% c("SE", "BE")), size = 3) +
+  scale_colour_manual(values = c("TRUE" = "#D73027", "FALSE" = "#4575B4"),
+                      guide = "none") +
+  geom_text_repel(aes(label = pays), size = 3, fontface = "bold",
+                  max.overlaps = 20) +
+  annotate("text",
+           x     = max(df_corr_nai$intensite_nai_2015) * 0.55,
+           y     = 15,
+           label = paste0("R² = ", round(corA$estimate^2, 3),
+                          "\np = ", round(corA$p.value, 4)),
+           size = 3.5, hjust = 0, colour = "black") +
+  labs(
+    title    = "Ind. 01 — Corrélation intensité NAI 2015 vs score So_Fo (SESI)",
+    subtitle = "Source : EXIOBASE v3.10.2 + Forest Europe (intensité NAI) | Usubiaga-Liaño & Ekins (2021) (SESI)",
+    x        = "Intensité NAI 2015 (extraction t / NAI 1 000 m³)",
+    y        = "Score So_Fo (/100)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("Ind01_correlation_NAI2015_SoFo.png",
+       plot = p_corrA, width = 10, height = 7, dpi = 300)
+p_corrA
+```
+
+```{r scatter-correlation-B}
+# scatter : intensite_nai 2015 vs to.01 (SESPI forêts)
+p_corrB <- ggplot(df_corr_nai, aes(x = intensite_nai_2015, y = score_to01)) +
+  geom_smooth(method = "lm", se = TRUE,
+              colour = "#4575B4", fill = "#ABD9E9", alpha = 0.3) +
+  geom_point(aes(colour = pays %in% c("SE", "BE")), size = 3) +
+  scale_colour_manual(values = c("TRUE" = "#D73027", "FALSE" = "#4575B4"),
+                      guide = "none") +
+  geom_text_repel(aes(label = pays), size = 3, fontface = "bold",
+                  max.overlaps = 20) +
+  annotate("text",
+           x     = max(df_corr_nai$intensite_nai_2015) * 0.55,
+           y     = min(df_corr_nai$score_to01) + 2,
+           label = paste0("R² = ", round(corB$estimate^2, 3),
+                          "\np = ", round(corB$p.value, 4)),
+           size = 3.5, hjust = 0, colour = "black") +
+  labs(
+    title    = "Ind. 01 — Corrélation intensité NAI 2015 vs score to.01 (SESPI forêts)",
+    subtitle = "Source : EXIOBASE v3.10.2 + Forest Europe (intensité NAI) | Usubiaga-Liaño & Ekins (2021) (SESPI)",
+    x        = "Intensité NAI 2015 (extraction t / NAI 1 000 m³)",
+    y        = "Score SESPI to.01 (/100)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("Ind01_correlation_NAI2015_to01.png",
+       plot = p_corrB, width = 10, height = 7, dpi = 300)
+p_corrB
+```
+
+```{r taux-variation-2010-2015}
+# ============================================================
+# Analyse 2 — Taux de variation intensite_nai 2010 → 2015
+# ============================================================
+
+# extraire 2010 et 2015, calculer le taux de variation
+taux_variation <- df_nai_complet %>%
+  filter(annee %in% c(2010, 2015)) %>%
+  pivot_wider(names_from = annee,
+              values_from = intensite_nai,
+              names_prefix = "nai_") %>%
+  filter(!is.na(nai_2010) & !is.na(nai_2015)) %>%
+  mutate(
+    variation_abs = nai_2015 - nai_2010,
+    variation_pct = round((nai_2015 - nai_2010) / nai_2010 * 100, 1),
+    direction     = case_when(
+      variation_pct >  5  ~ "Hausse",
+      variation_pct < -5  ~ "Baisse",
+      TRUE                ~ "Stable"
+    ),
+    score_to01 = scores_to01[pays]
+  ) %>%
+  arrange(variation_pct)
+
+cat("=== Taux de variation intensite_nai 2010 → 2015 ===\n")
+print(taux_variation %>%
+  select(pays, nai_2010, nai_2015, variation_abs, variation_pct,
+         direction, score_to01), n = 20)
+```
+
+```{r plot-variation}
+# graphique : taux de variation par pays, coloré par direction
+p_variation <- ggplot(
+    taux_variation,
+    aes(x = reorder(pays, variation_pct),
+        y = variation_pct,
+        fill = direction)
+  ) +
+  geom_col() +
+  geom_hline(yintercept = 0, colour = "black", linewidth = 0.5) +
+  scale_fill_manual(
+    values = c("Hausse" = "#D73027", "Stable" = "#FFFFBF", "Baisse" = "#1A9850")
+  ) +
+  coord_flip() +
+  labs(
+    title    = "Ind. 01 — Taux de variation de l'intensité NAI entre 2010 et 2015 par pays",
+    subtitle = "Source : EXIOBASE v3.10.2 + Forest Europe | Seuil stabilité : ±5%",
+    x        = NULL,
+    y        = "Variation (%) 2010 → 2015",
+    fill     = "Tendance"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    panel.grid.minor = element_blank(),
+    axis.text.y      = element_text(face = "bold")
+  )
+
+ggsave("Ind01_variation_NAI_2010_2015.png",
+       plot = p_variation, width = 10, height = 7, dpi = 300)
+p_variation
+```
