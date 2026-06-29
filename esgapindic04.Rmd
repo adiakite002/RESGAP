@@ -1,0 +1,476 @@
+---
+title: "Mission 2 — Analyse de la capacité explicative des pressions EXIOBASE vis-à-vis des écarts aux standards ESGAP"
+author: "Abdoulaye Diakité — AFD ISR ECO, Équipe Biodiversité"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  fig.align  = "center"
+)
+```
+
+```{r ind04-extraction-stressors}
+# Objectif : extraire les pressions eau bleue Ind. 04 depuis intermediate
+# en filtrant sur les stressors de mapping_ind04 (déjà défini dans le Rmd)
+# puis agréger par pays × stressor × année
+
+stressors_ind04 <- mapping_ind04$stressor
+
+pressions_ind04 <- intermediate %>%
+  filter(stressor %in% stressors_ind04) %>%
+  group_by(pays, stressor, annee) %>%
+  summarise(valeur = sum(valeur, na.rm = TRUE), .groups = "drop")
+
+cat("Lignes dans pressions_ind04 :", nrow(pressions_ind04), "\n")
+cat("Pays couverts               :", n_distinct(pressions_ind04$pays), "\n")
+cat("Années disponibles          :", paste(range(pressions_ind04$annee), collapse = " - "), "\n")
+cat("Stressors disponibles       :", n_distinct(pressions_ind04$stressor), "\n")
+cat("\nListe des stressors :\n")
+print(unique(pressions_ind04$stressor))
+```
+  
+```{r ind04-agregation-totale}
+# Objectif : consommation totale eau bleue par pays × année
+# agrégation des 13 stressors disponibles (Domestic absent d'EXIOBASE)
+
+conso_totale_ind04 <- pressions_ind04 %>%
+  group_by(pays, annee) %>%
+  summarise(
+    conso_totale_m3 = sum(valeur, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# classement par consommation moyenne sur la période
+classement_ind04 <- conso_totale_ind04 %>%
+  group_by(pays) %>%
+  summarise(
+    conso_moy_m3 = mean(conso_totale_m3, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(conso_moy_m3)) %>%
+  mutate(rang = row_number())
+
+cat("=== Classement pays par consommation eau bleue moy. 1995-2022 ===\n")
+print(classement_ind04, n = 27)
+```
+
+```{r ind04-sous-ensembles-sectoriels}
+# ============================================================
+# Étape 2 — Décomposition par secteur (Agriculture, Electricité, Manufacturing)
+# ============================================================
+
+# définition des groupes sectoriels
+stressors_agri <- c(
+  "Water Consumption Blue - Agriculture - wheat",
+  "Water Consumption Blue - Agriculture - other cereals",
+  "Water Consumption Blue - Agriculture - vegetables",
+  "Water Consumption Blue - Agriculture - fruits",
+  "Water Consumption Blue - Agriculture - other crops",
+  "Water Consumption Blue - Agriculture - fodder crops"
+)
+
+stressors_elec <- c(
+  "Water Consumption Blue - Electricity - tower - Electricity by coal",
+  "Water Consumption Blue - Electricity - tower - Electricity by gas",
+  "Water Consumption Blue - Electricity - tower - Electricity by nuclear",
+  "Water Consumption Blue - Electricity - once-through - Electricity by coal",
+  "Water Consumption Blue - Electricity - once-through - Electricity by nuclear"
+)
+
+stressors_manu <- c(
+  "Water Consumption Blue - Manufacturing - Chemicals nec",
+  "Water Consumption Blue - Manufacturing - Basic iron and steel and of ferro-alloys and first products thereof"
+)
+
+# ajout colonne secteur
+pressions_ind04_sect <- pressions_ind04 %>%
+  mutate(
+    secteur = case_when(
+      stressor %in% stressors_agri ~ "Agriculture",
+      stressor %in% stressors_elec ~ "Electricite",
+      stressor %in% stressors_manu ~ "Manufacturing",
+      TRUE                         ~ "Autre"
+    )
+  )
+
+# consommation par secteur × pays × année
+conso_secteur <- pressions_ind04_sect %>%
+  group_by(pays, annee, secteur) %>%
+  summarise(
+    conso_m3 = sum(valeur, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# part relative par secteur dans le total
+conso_secteur <- conso_secteur %>%
+  left_join(conso_totale_ind04, by = c("pays", "annee")) %>%
+  mutate(part_pct = round(conso_m3 / conso_totale_m3 * 100, 1))
+
+# résumé : contribution moyenne par secteur (moyenne sur pays et années)
+contrib_secteur <- conso_secteur %>%
+  group_by(secteur) %>%
+  summarise(
+    part_moy_pct = round(mean(part_pct, na.rm = TRUE), 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(part_moy_pct))
+
+cat("=== Contribution moyenne par secteur ===\n")
+print(contrib_secteur)
+```
+
+```{r ind04-stats-par-secteur}
+# Objectif : stats descriptives par pays × secteur sur 1995-2022
+# Agriculture, Electricite, Manufacturing
+
+stats_secteur_ind04 <- conso_secteur %>%
+  group_by(pays, secteur) %>%
+  summarise(
+    moy     = round(mean(conso_m3,  na.rm = TRUE), 3),
+    min     = round(min(conso_m3,   na.rm = TRUE), 3),
+    max     = round(max(conso_m3,   na.rm = TRUE), 3),
+    var_abs = round(max(conso_m3,   na.rm = TRUE) - min(conso_m3, na.rm = TRUE), 3),
+    var_pct = round((max(conso_m3,  na.rm = TRUE) - min(conso_m3, na.rm = TRUE)) /
+                      min(conso_m3, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(secteur, desc(moy))
+
+cat("=== Stats descriptives par pays × secteur (Mm³) ===\n")
+print(stats_secteur_ind04, n = Inf)
+```
+
+```{r ind04-stats-totale}
+# Objectif : stats descriptives par pays sur la consommation totale agrégée
+
+stats_totale_ind04 <- conso_totale_ind04 %>%
+  group_by(pays) %>%
+  summarise(
+    moy     = round(mean(conso_totale_m3,  na.rm = TRUE), 3),
+    min     = round(min(conso_totale_m3,   na.rm = TRUE), 3),
+    max     = round(max(conso_totale_m3,   na.rm = TRUE), 3),
+    var_abs = round(max(conso_totale_m3,   na.rm = TRUE) - min(conso_totale_m3, na.rm = TRUE), 3),
+    var_pct = round((max(conso_totale_m3,  na.rm = TRUE) - min(conso_totale_m3, na.rm = TRUE)) /
+                      min(conso_totale_m3, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(moy))
+
+cat("=== Stats descriptives par pays — consommation totale agrégée (Mm³) ===\n")
+print(stats_totale_ind04, n = Inf)
+```
+
+```{r ind04-timeseries-total}
+# ============================================================
+# Étape 4a — Time series consommation totale eau bleue (27 pays)
+# ============================================================
+
+p_ts_ind04 <- ggplot(
+    conso_totale_ind04,
+    aes(x = annee, y = conso_totale_m3)
+  ) +
+  geom_line(colour = "#D73027", linewidth = 0.7) +
+  facet_wrap(~ pays, ncol = 4, scales = "free_y") +
+  scale_x_continuous(breaks = c(1995, 2005, 2015, 2022)) +
+  labs(
+    title    = "Ind. 04 — Évolution de la consommation d'eau bleue totale par pays (1995–2022)",
+    subtitle = "13 stressors agrégés (Agriculture + Électricité + Manufacturing) | Source : EXIOBASE v3.10.2",
+    x        = NULL,
+    y        = "Consommation totale (m³)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    panel.grid.minor = element_blank(),
+    strip.text       = element_text(face = "bold"),
+    axis.text.x      = element_text(angle = 45, hjust = 1)
+  )
+
+ggsave(
+  filename = "Ind04_timeseries_consommation_eau_27pays.png",
+  plot     = p_ts_ind04,
+  width    = 16,
+  height   = 20,
+  dpi      = 300
+)
+
+p_ts_ind04
+```
+
+```{r ind04-timeseries-secteurs}
+# ============================================================
+# Étape 4b — Time series par secteur (3 figures)
+# ============================================================
+
+for (sect in c("Agriculture", "Electricite", "Manufacturing")) {
+
+  df_sect <- conso_secteur %>% filter(secteur == sect)
+
+  titre_sect <- switch(sect,
+    "Agriculture"   = "Agriculture (6 stressors)",
+    "Electricite"   = "Électricité — tower + once-through (5 stressors)",
+    "Manufacturing" = "Manufacturing — Chimie + Acier (2 stressors)"
+  )
+
+  p_sect <- ggplot(df_sect, aes(x = annee, y = conso_m3)) +
+    geom_line(colour = "#4575B4", linewidth = 0.7) +
+    facet_wrap(~ pays, ncol = 4, scales = "free_y") +
+    scale_x_continuous(breaks = c(1995, 2005, 2015, 2022)) +
+    labs(
+      title    = paste0("Ind. 04 — Consommation eau bleue : ", titre_sect),
+      subtitle = "Source : EXIOBASE v3.10.2",
+      x        = NULL,
+      y        = "Consommation (m³)"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 12),
+      plot.subtitle    = element_text(size = 9, colour = "black"),
+      panel.grid.minor = element_blank(),
+      strip.text       = element_text(face = "bold"),
+      axis.text.x      = element_text(angle = 45, hjust = 1)
+    )
+
+  nom_fichier <- paste0("Ind04_timeseries_", sect, "_27pays.png")
+
+  ggsave(
+    filename = nom_fichier,
+    plot     = p_sect,
+    width    = 16,
+    height   = 20,
+    dpi      = 300
+  )
+
+  print(p_sect)
+  cat("Sauvegardé :", nom_fichier, "\n")
+}
+```
+
+```{r ind04-taux-variation}
+# ============================================================
+# Étape 5 — Taux de variation 2010 → 2015
+# aligné avec la fenêtre SESPI to.04 (Year 0=2010, Year 1=2015)
+# ============================================================
+
+# scores So_SW (SESI eau douce) — 1 point 2015
+scores_sosw <- c(
+  AT=100.0, BE=12.1,  BG=82.8,  HR=100.0, CY=0.0,
+  CZ=91.2,  DK=82.1,  EE=92.4,  FI=99.7,  FR=87.1,
+  DE=79.7,  GR=30.6,  HU=99.9,  IE=100.0, IT=51.3,
+  LV=100.0, LT=100.0, LU=0.0,   NL=39.1,  PL=76.8,
+  PT=36.7,  RO=88.4,  SK=100.0, SI=100.0, ES=25.2,
+  SE=98.5,  GB=88.9
+)
+
+# scores to.04 (SESPI eau douce) — extraits de SM_ESGAP
+scores_to04 <- c(
+  AT=100.0, BE=29.3,  BG=90.3,  HR=99.7,  CY=14.7,
+  CZ=92.8,  DK=89.6,  EE=95.6,  FI=99.8,  FR=88.0,
+  DE=87.7,  GR=52.3,  HU=86.3,  IE=100.0, IT=67.7,
+  LV=100.0, LT=100.0, LU=22.4,  NL=62.6,  PL=85.9,
+  PT=60.1,  RO=94.0,  SK=100.0, SI=100.0, ES=45.2,
+  SE=98.5,  GB=88.9
+)
+
+# extraction 2010 et 2015
+variation_ind04 <- conso_totale_ind04 %>%
+  filter(annee %in% c(2010, 2015)) %>%
+  pivot_wider(
+    names_from  = annee,
+    values_from = conso_totale_m3,
+    names_prefix = "conso_"
+  ) %>%
+  filter(!is.na(conso_2010) & !is.na(conso_2015)) %>%
+  mutate(
+    variation_abs = conso_2015 - conso_2010,
+    variation_pct = round((conso_2015 - conso_2010) / conso_2010 * 100, 1),
+    direction     = case_when(
+      variation_pct >  5  ~ "Hausse",
+      variation_pct < -5  ~ "Baisse",
+      TRUE                ~ "Stable"
+    ),
+    score_sosw = scores_sosw[pays],
+    score_to04 = scores_to04[pays]
+  ) %>%
+  arrange(variation_pct)
+
+cat("=== Taux de variation consommation eau bleue 2010 → 2015 ===\n")
+print(variation_ind04 %>%
+  select(pays, conso_2010, conso_2015, variation_pct, direction,
+         score_sosw, score_to04), n = 27)
+```
+
+```{r ind04-correlations-console}
+# Objectif : corrélations Pearson entre conso moy et scores SESI/SESPI
+# sans graphique — résultats console uniquement
+
+df_corr_ind04 <- classement_ind04 %>%
+  mutate(
+    score_sosw = scores_sosw[pays],
+    score_to04 = scores_to04[pays]
+  ) %>%
+  filter(!is.na(score_sosw) & !is.na(score_to04))
+
+# Corrélation A : conso moy vs So_SW (SESI)
+corA <- cor.test(df_corr_ind04$conso_moy_m3, df_corr_ind04$score_sosw)
+
+# Corrélation B : conso moy vs to.04 (SESPI)
+corB <- cor.test(df_corr_ind04$conso_moy_m3, df_corr_ind04$score_to04)
+
+cat("=== Corrélation A : conso moy vs So_SW (SESI) ===\n")
+cat("r       :", round(corA$estimate, 3), "\n")
+cat("R²      :", round(corA$estimate^2, 3), "\n")
+cat("p-value :", round(corA$p.value, 4), "\n\n")
+
+cat("=== Corrélation B : conso moy vs to.04 (SESPI) ===\n")
+cat("r       :", round(corB$estimate, 3), "\n")
+cat("R²      :", round(corB$estimate^2, 3), "\n")
+cat("p-value :", round(corB$p.value, 4), "\n")
+
+cat("\nN pays :", nrow(df_corr_ind04), "\n")
+```
+```{r ind04-conso-2015}
+# Objectif : extraire la consommation totale par pays pour 2015 uniquement
+
+conso_2015_ind04 <- conso_totale_ind04 %>%
+  filter(annee == 2015) %>%
+  arrange(desc(conso_totale_m3))
+
+cat("=== Consommation totale eau bleue par pays — 2015 (Mm³) ===\n")
+print(conso_2015_ind04, n = Inf)
+```
+```{r ind04-correlation-conso2015-sosw}
+# Objectif : corrélation conso totale 2015 vs So_SW
+# alignement temporel exact — les deux sur 2015
+
+df_corr_2015 <- conso_2015_ind04 %>%
+  filter(pays != "MT") %>%
+  mutate(score_sosw = scores_sosw[pays]) %>%
+  filter(!is.na(score_sosw))
+
+cor_2015 <- cor.test(df_corr_2015$conso_totale_m3, df_corr_2015$score_sosw)
+
+cat("=== Corrélation : conso totale 2015 vs So_SW (SESI 2015) ===\n")
+cat("r       :", round(cor_2015$estimate, 3), "\n")
+cat("R²      :", round(cor_2015$estimate^2, 3), "\n")
+cat("p-value :", round(cor_2015$p.value, 4), "\n")
+cat("N pays  :", nrow(df_corr_2015), "\n")
+```
+```{r ind04-conso-cumulee-secteur}
+# Objet 1 : total cumulé sur toute la période par pays × secteur
+# exemple : combien de Mm³ la Suède a consommé pour l'agriculture de 1995 à 2022
+
+conso_cumul_secteur <- conso_secteur %>%
+  group_by(pays, secteur) %>%
+  summarise(
+    conso_totale_periode_mm3 = round(sum(conso_m3, na.rm = TRUE), 2),
+    n_annees                 = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(secteur, desc(conso_totale_periode_mm3))
+
+cat("=== Consommation totale cumulée 1995-2022 par pays × secteur (Mm³) ===\n")
+print(conso_cumul_secteur, n = Inf)
+```
+
+```{r ind04-graph-cumul-secteur}
+# Objectif : consommation cumulée 1995-2022 par pays × secteur
+# barres groupées par secteur, pays ordonnés par total décroissant
+
+ordre_pays_cumul <- conso_cumul_secteur %>%
+  group_by(pays) %>%
+  summarise(total = sum(conso_totale_periode_mm3), .groups = "drop") %>%
+  arrange(desc(total)) %>%
+  pull(pays)
+
+p_cumul <- ggplot(
+    conso_cumul_secteur,
+    aes(x = factor(pays, levels = rev(ordre_pays_cumul)),
+        y = conso_totale_periode_mm3,
+        fill = secteur)
+  ) +
+  geom_col() +
+  scale_fill_manual(
+    values = c("Agriculture" = "#1A9850",
+               "Electricite" = "#4575B4",
+               "Manufacturing" = "#FDAE61"),
+    name = "Secteur"
+  ) +
+  coord_flip() +
+  labs(
+    title    = "Ind. 04 — Consommation totale d'eau bleue cumulée par pays et par secteur (1995–2022)",
+    subtitle = "Somme des 28 valeurs annuelles | Source : EXIOBASE v3.10.2 | Unité : Mm³",
+    x        = NULL,
+    y        = "Consommation cumulée (Mm³)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    panel.grid.minor = element_blank(),
+    axis.text.y      = element_text(face = "bold"),
+    legend.position  = "bottom"
+  )
+
+ggsave("Ind04_cumul_secteur_27pays.png",
+       plot = p_cumul, width = 12, height = 10, dpi = 300)
+p_cumul
+```
+
+```{r ind04-graph-annuel-secteur}
+# Objectif : évolution annuelle de la consommation par secteur
+# une courbe par secteur, facet_wrap par pays
+
+p_annuel <- ggplot(
+    conso_secteur,
+    aes(x = annee, y = conso_m3, colour = secteur)
+  ) +
+  geom_line(linewidth = 0.7) +
+  scale_colour_manual(
+    values = c("Agriculture" = "#1A9850",
+               "Electricite" = "#4575B4",
+               "Manufacturing" = "#FDAE61"),
+    name = "Secteur"
+  ) +
+  facet_wrap(~ pays, ncol = 4, scales = "free_y") +
+  scale_x_continuous(breaks = c(1995, 2005, 2015, 2022)) +
+  labs(
+    title    = "Ind. 04 — Évolution annuelle de la consommation d'eau bleue par pays et par secteur (1995–2022)",
+    subtitle = "3 secteurs : Agriculture (vert) | Électricité (bleu) | Manufacturing (orange) | Source : EXIOBASE v3.10.2",
+    x        = NULL,
+    y        = "Consommation annuelle (Mm³)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    panel.grid.minor = element_blank(),
+    strip.text       = element_text(face = "bold"),
+    axis.text.x      = element_text(angle = 45, hjust = 1),
+    legend.position  = "bottom"
+  )
+
+ggsave("Ind04_annuel_secteur_27pays.png",
+       plot = p_annuel, width = 16, height = 20, dpi = 300)
+p_annuel
+```
