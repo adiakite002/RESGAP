@@ -1,0 +1,418 @@
+---
+title: "Mission 2 — Analyse de la capacité explicative des pressions EXIOBASE vis-à-vis des écarts aux standards ESGAP"
+author: "Abdoulaye Diakité — AFD ISR ECO, Équipe Biodiversité"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  fig.align  = "center"
+)
+```
+
+```{r ind03-extraction-stressors}
+# Objectif : extraire les pressions nappes phréatiques Ind. 03 depuis intermediate
+# en filtrant sur les stressors de mapping_ind03
+
+stressors_ind03 <- mapping_ind03$stressor
+
+pressions_ind03 <- intermediate %>%
+  filter(stressor %in% stressors_ind03) %>%
+  group_by(pays, stressor, annee) %>%
+  summarise(valeur = sum(valeur, na.rm = TRUE), .groups = "drop")
+
+cat("Lignes dans pressions_ind03 :", nrow(pressions_ind03), "\n")
+cat("Pays couverts               :", n_distinct(pressions_ind03$pays), "\n")
+cat("Années disponibles          :", paste(range(pressions_ind03$annee), collapse = " - "), "\n")
+cat("Stressors disponibles       :", n_distinct(pressions_ind03$stressor), "\n")
+cat("\nListe des stressors :\n")
+print(unique(pressions_ind03$stressor))
+```
+
+```{r ind03-definition-groupes}
+# Objectif : définir les 3 groupes sectoriels pour les tests
+# Groupe 1 : eau bleue Agriculture | Groupe 2 : eau bleue Électricité
+# Groupe 3 : dépôts atmosphériques (N, P, métaux lourds, CO2)
+
+stressors_agri_ind03 <- c(
+  "Water Consumption Blue - Agriculture - wheat",
+  "Water Consumption Blue - Agriculture - other cereals",
+  "Water Consumption Blue - Agriculture - vegetables",
+  "Water Consumption Blue - Agriculture - fruits",
+  "Water Consumption Blue - Agriculture - other crops",
+  "Water Consumption Blue - Agriculture - fodder crops"
+)
+
+stressors_elec_ind03 <- c(
+  "Water Consumption Blue - Electricity - tower - Electricity by coal",
+  "Water Consumption Blue - Electricity - tower - Electricity by nuclear",
+  "Water Consumption Blue - Electricity - once-through - Electricity by coal",
+  "Water Consumption Blue - Electricity - once-through - Electricity by nuclear"
+)
+
+stressors_pollution_ind03 <- c(
+  "N - agriculture - water",
+  "P - agriculture - water",
+  "As - combustion - air",
+  "Cd - combustion - air",
+  "Hg - combustion - air",
+  "Pb - combustion - air",
+  "Ni - combustion - air",
+  "Cr - combustion - air",
+  "Benzo(a)pyrene - combustion - air",
+  "PCBs - combustion - air",
+  "CO2 - combustion - air"
+)
+
+pressions_ind03 <- pressions_ind03 %>%
+  mutate(
+    groupe = case_when(
+      stressor %in% stressors_agri_ind03      ~ "Eau_Agriculture",
+      stressor %in% stressors_elec_ind03      ~ "Eau_Electricite",
+      stressor %in% stressors_pollution_ind03 ~ "Pollution_Depots",
+      TRUE ~ "Autre"
+    )
+  )
+
+cat("=== Répartition stressors par groupe ===\n")
+print(pressions_ind03 %>% distinct(stressor, groupe) %>% arrange(groupe))
+```
+
+```{r ind03-definition-groupes-corrige}
+# Objectif : redéfinir les groupes avec unités cohérentes
+# Groupe A : eau totale (Mm³) — Agriculture + Électricité, avec sous-totaux
+# Groupe B : dépôts combustion (kg) — métaux lourds + CO2
+# Groupe C : N et P agriculture (kg) — eutrophisation
+
+stressors_eau_agri <- c(
+  "Water Consumption Blue - Agriculture - wheat",
+  "Water Consumption Blue - Agriculture - other cereals",
+  "Water Consumption Blue - Agriculture - vegetables",
+  "Water Consumption Blue - Agriculture - fruits",
+  "Water Consumption Blue - Agriculture - other crops",
+  "Water Consumption Blue - Agriculture - fodder crops"
+)
+
+stressors_eau_elec <- c(
+  "Water Consumption Blue - Electricity - tower - Electricity by coal",
+  "Water Consumption Blue - Electricity - tower - Electricity by nuclear",
+  "Water Consumption Blue - Electricity - once-through - Electricity by coal",
+  "Water Consumption Blue - Electricity - once-through - Electricity by nuclear"
+)
+
+stressors_depots_combustion <- c(
+  "As - combustion - air",
+  "Cd - combustion - air",
+  "Hg - combustion - air",
+  "Pb - combustion - air",
+  "Ni - combustion - air",
+  "Cr - combustion - air",
+  "Benzo(a)pyrene - combustion - air",
+  "PCBs - combustion - air",
+  "CO2 - combustion - air"
+)
+
+stressors_np_agri <- c(
+  "N - agriculture - water",
+  "P - agriculture - water"
+)
+
+pressions_ind03 <- pressions_ind03 %>%
+  mutate(
+    groupe = case_when(
+      stressor %in% stressors_eau_agri          ~ "Eau_Agriculture",
+      stressor %in% stressors_eau_elec          ~ "Eau_Electricite",
+      stressor %in% stressors_depots_combustion ~ "Depots_Combustion",
+      stressor %in% stressors_np_agri           ~ "NP_Agriculture",
+      TRUE ~ "Autre"
+    ),
+    unite = case_when(
+      groupe %in% c("Eau_Agriculture", "Eau_Electricite") ~ "Mm3",
+      groupe %in% c("Depots_Combustion", "NP_Agriculture") ~ "kg",
+      TRUE ~ NA_character_
+    )
+  )
+
+cat("=== Répartition stressors par groupe ===\n")
+print(pressions_ind03 %>% distinct(stressor, groupe, unite) %>% arrange(groupe))
+```
+
+```{r ind03-pression-eau-totale}
+# Objectif : pression eau totale (Mm³) = Agriculture + Électricité
+# avec sous-totaux sectoriels pour voir la part de chacun
+
+pression_eau_ind03 <- pressions_ind03 %>%
+  filter(groupe %in% c("Eau_Agriculture", "Eau_Electricite")) %>%
+  group_by(pays, annee, groupe) %>%
+  summarise(valeur = sum(valeur, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = groupe, values_from = valeur, values_fill = 0) %>%
+  mutate(
+    eau_totale_mm3   = Eau_Agriculture + Eau_Electricite,
+    part_agri_pct    = round(Eau_Agriculture / eau_totale_mm3 * 100, 1),
+    part_elec_pct    = round(Eau_Electricite / eau_totale_mm3 * 100, 1)
+  )
+
+cat("=== Pression eau totale par pays × année (Mm³) ===\n")
+print(pression_eau_ind03, n = 20)
+```
+
+```{r ind03-pression-depots-combustion}
+# Objectif : pression dépôts combustion (kg) — métaux lourds + CO2
+
+pression_depots_ind03 <- pressions_ind03 %>%
+  filter(groupe == "Depots_Combustion") %>%
+  group_by(pays, annee) %>%
+  summarise(depots_kg = sum(valeur, na.rm = TRUE), .groups = "drop")
+
+cat("=== Pression dépôts combustion par pays × année (kg) ===\n")
+print(pression_depots_ind03, n = 20)
+```
+
+```{r ind03-pression-np-agriculture}
+# Objectif : pression N et P agriculture (kg) 
+
+pression_np_ind03 <- pressions_ind03 %>%
+  filter(groupe == "NP_Agriculture") %>%
+  group_by(pays, annee) %>%
+  summarise(np_kg = sum(valeur, na.rm = TRUE), .groups = "drop")
+
+cat("=== Pression N+P agriculture par pays × année (kg) ===\n")
+print(pression_np_ind03, n = 20)
+```
+```{r ind03-stats-eau}
+# Objectif : stats descriptives eau totale + sous-groupes par pays sur 1995-2022
+
+stats_eau_ind03 <- pression_eau_ind03 %>%
+  group_by(pays) %>%
+  summarise(
+    moy_total     = round(mean(eau_totale_mm3,    na.rm = TRUE), 2),
+    moy_agri      = round(mean(Eau_Agriculture,   na.rm = TRUE), 2),
+    moy_elec      = round(mean(Eau_Electricite,   na.rm = TRUE), 2),
+    part_agri_moy = round(mean(part_agri_pct,     na.rm = TRUE), 1),
+    part_elec_moy = round(mean(part_elec_pct,     na.rm = TRUE), 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(moy_total))
+
+cat("=== Stats eau totale par pays (Mm³) — 1995-2022 ===\n")
+print(stats_eau_ind03, n = Inf)
+```
+
+```{r ind03-stats-depots}
+# Objectif : stats descriptives dépôts combustion par pays sur 1995-2022
+
+stats_depots_ind03 <- pression_depots_ind03 %>%
+  group_by(pays) %>%
+  summarise(
+    moy     = round(mean(depots_kg,  na.rm = TRUE), 2),
+    min     = round(min(depots_kg,   na.rm = TRUE), 2),
+    max     = round(max(depots_kg,   na.rm = TRUE), 2),
+    var_abs = round(max(depots_kg,   na.rm = TRUE) - min(depots_kg, na.rm = TRUE), 2),
+    var_pct = round((max(depots_kg,  na.rm = TRUE) - min(depots_kg, na.rm = TRUE)) /
+                      min(depots_kg, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(moy))
+
+cat("=== Stats dépôts combustion par pays (kg) — 1995-2022 ===\n")
+print(stats_depots_ind03, n = Inf)
+```
+
+```{r ind03-stats-np}
+# Objectif : stats descriptives N+P agriculture par pays sur 1995-2022
+
+stats_np_ind03 <- pression_np_ind03 %>%
+  group_by(pays) %>%
+  summarise(
+    moy     = round(mean(np_kg,  na.rm = TRUE), 2),
+    min     = round(min(np_kg,   na.rm = TRUE), 2),
+    max     = round(max(np_kg,   na.rm = TRUE), 2),
+    var_abs = round(max(np_kg,   na.rm = TRUE) - min(np_kg, na.rm = TRUE), 2),
+    var_pct = round((max(np_kg,  na.rm = TRUE) - min(np_kg, na.rm = TRUE)) /
+                      min(np_kg, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(moy))
+
+cat("=== Stats N+P agriculture par pays (kg) — 1995-2022 ===\n")
+print(stats_np_ind03, n = Inf)
+
+```
+```{r ind03-timeseries-eau}
+# Objectif : time series eau totale (Mm³) par pays, 27 pays
+# même style que Ind. 01 et Ind. 04
+
+p_ts_eau_ind03 <- ggplot(
+    pression_eau_ind03,
+    aes(x = annee, y = eau_totale_mm3)
+  ) +
+  geom_line(colour = "#D73027", linewidth = 0.7) +
+  facet_wrap(~ pays, ncol = 4, scales = "free_y") +
+  scale_x_continuous(breaks = c(1995, 2005, 2015, 2022)) +
+  labs(
+    title    = "Ind. 03 — Évolution de la pression eau totale par pays (1995–2022)",
+    subtitle = "Agriculture + Électricité agrégées | Source : EXIOBASE v3.10.2",
+    x        = NULL,
+    y        = "Eau totale (Mm³)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    panel.grid.minor = element_blank(),
+    strip.text       = element_text(face = "bold"),
+    axis.text.x      = element_text(angle = 45, hjust = 1)
+  )
+
+ggsave("Ind03_timeseries_eau_totale_27pays.png",
+       plot = p_ts_eau_ind03, width = 16, height = 20, dpi = 300)
+p_ts_eau_ind03
+```
+
+```{r ind03-timeseries-depots}
+# Objectif : time series dépôts combustion (kg) par pays
+
+p_ts_depots_ind03 <- ggplot(
+    pression_depots_ind03,
+    aes(x = annee, y = depots_kg)
+  ) +
+  geom_line(colour = "#4575B4", linewidth = 0.7) +
+  facet_wrap(~ pays, ncol = 4, scales = "free_y") +
+  scale_x_continuous(breaks = c(1995, 2005, 2015, 2022)) +
+  labs(
+    title    = "Ind. 03 — Évolution des dépôts combustion par pays (1995–2022)",
+    subtitle = "Métaux lourds + Benzo(a)pyrene + PCBs + CO2 | Source : EXIOBASE v3.10.2",
+    x        = NULL,
+    y        = "Dépôts combustion (kg)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    panel.grid.minor = element_blank(),
+    strip.text       = element_text(face = "bold"),
+    axis.text.x      = element_text(angle = 45, hjust = 1)
+  )
+
+ggsave("Ind03_timeseries_depots_27pays.png",
+       plot = p_ts_depots_ind03, width = 16, height = 20, dpi = 300)
+p_ts_depots_ind03
+```
+
+```{r ind03-timeseries-np}
+# Objectif : time series N+P agriculture (kg) par pays
+
+p_ts_np_ind03 <- ggplot(
+    pression_np_ind03,
+    aes(x = annee, y = np_kg)
+  ) +
+  geom_line(colour = "#1A9850", linewidth = 0.7) +
+  facet_wrap(~ pays, ncol = 4, scales = "free_y") +
+  scale_x_continuous(breaks = c(1995, 2005, 2015, 2022)) +
+  labs(
+    title    = "Ind. 03 — Évolution de la pression N+P agriculture par pays (1995–2022)",
+    subtitle = "Azote + Phosphore | Source : EXIOBASE v3.10.2",
+    x        = NULL,
+    y        = "N+P agriculture (kg)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    panel.grid.minor = element_blank(),
+    strip.text       = element_text(face = "bold"),
+    axis.text.x      = element_text(angle = 45, hjust = 1)
+  )
+
+ggsave("Ind03_timeseries_NP_agriculture_27pays.png",
+       plot = p_ts_np_ind03, width = 16, height = 20, dpi = 300)
+p_ts_np_ind03
+```
+
+```{r ind03-taux-variation-eau}
+# Objectif : taux de variation eau totale, fenêtre SESPI to.03 (2009→2015)
+
+variation_eau_ind03 <- pression_eau_ind03 %>%
+  filter(annee %in% c(2009, 2015)) %>%
+  select(pays, annee, eau_totale_mm3) %>%
+  pivot_wider(names_from = annee, values_from = eau_totale_mm3,
+              names_prefix = "eau_") %>%
+  filter(!is.na(eau_2009) & !is.na(eau_2015)) %>%
+  mutate(
+    variation_abs = round(eau_2015 - eau_2009, 2),
+    variation_pct = round((eau_2015 - eau_2009) / eau_2009 * 100, 1),
+    direction     = case_when(
+      variation_pct >  5  ~ "Hausse",
+      variation_pct < -5  ~ "Baisse",
+      TRUE                ~ "Stable"
+    )
+  ) %>%
+  arrange(variation_pct)
+
+cat("=== Taux de variation eau totale 2009 → 2015 ===\n")
+print(variation_eau_ind03, n = 27)
+```
+
+```{r ind03-taux-variation-depots}
+# Objectif : taux de variation dépôts combustion, fenêtre 2009→2015
+
+variation_depots_ind03 <- pression_depots_ind03 %>%
+  filter(annee %in% c(2009, 2015)) %>%
+  pivot_wider(names_from = annee, values_from = depots_kg,
+              names_prefix = "depots_") %>%
+  filter(!is.na(depots_2009) & !is.na(depots_2015)) %>%
+  mutate(
+    variation_abs = round(depots_2015 - depots_2009, 2),
+    variation_pct = round((depots_2015 - depots_2009) / depots_2009 * 100, 1),
+    direction     = case_when(
+      variation_pct >  5  ~ "Hausse",
+      variation_pct < -5  ~ "Baisse",
+      TRUE                ~ "Stable"
+    )
+  ) %>%
+  arrange(variation_pct)
+
+cat("=== Taux de variation dépôts combustion 2009 → 2015 ===\n")
+print(variation_depots_ind03, n = 28)
+```
+
+```{r ind03-taux-variation-np}
+# Objectif : taux de variation N+P agriculture, fenêtre 2009→2015
+
+variation_np_ind03 <- pression_np_ind03 %>%
+  filter(annee %in% c(2009, 2015)) %>%
+  pivot_wider(names_from = annee, values_from = np_kg,
+              names_prefix = "np_") %>%
+  filter(!is.na(np_2009) & !is.na(np_2015)) %>%
+  mutate(
+    variation_abs = round(np_2015 - np_2009, 2),
+    variation_pct = round((np_2015 - np_2009) / np_2009 * 100, 1),
+    direction     = case_when(
+      variation_pct >  5  ~ "Hausse",
+      variation_pct < -5  ~ "Baisse",
+      TRUE                ~ "Stable"
+    )
+  ) %>%
+  arrange(variation_pct)
+
+cat("=== Taux de variation N+P agriculture 2009 → 2015 ===\n")
+print(variation_np_ind03, n = 28)
+```

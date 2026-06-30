@@ -3188,3 +3188,18 @@ ggsave("Ind01_variation_NAI_2010_2015.png",
        plot = p_variation, width = 10, height = 7, dpi = 300)
 p_variation
 ```
+
+```{r ind04-setup}
+# chargement des données Ind. 04 depuis le pipeline existant
+# filtrer sur indicateur == "Ind. 04" via mapping_ind04
+
+pressions_ind04 <- intermediate %>%
+  filter(stressor == "Ind. 04")
+
+cat("Lignes dans pressions_ind04 :", nrow(pressions_ind04), "\n")
+cat("Pays couverts               :", n_distinct(pressions_ind04$pays), "\n")
+cat("Années disponibles          :", paste(range(pressions_ind04$annee), collapse = " - "), "\n")
+cat("Stressors disponibles       :", n_distinct(pressions_ind04$stressor), "\n")
+cat("\nListe des stressors :\n")
+print(unique(pressions_ind04$stressor))
+``` 

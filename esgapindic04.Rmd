@@ -473,4 +473,258 @@ p_annuel <- ggplot(
 ggsave("Ind04_annuel_secteur_27pays.png",
        plot = p_annuel, width = 16, height = 20, dpi = 300)
 p_annuel
+``` 
+```{r ind04-chargement-ressources-eau}
+# Objectif : charger les données de ressources en eau douce renouvelables
+# depuis SSPCloud (bucket projet-esteem)
+# fichier : ressources_eau_douce_renouvelables.csv (ou .parquet selon format)
+
+# chargement depuis S3
+ressources_eau <- s3read_using(
+  FUN =  readxl::read_excel,
+  object = "s3://projet-esteem/EXIOBASE/ressources en eau douce renouvelables par pays en Mm³an.xlsx",
+  bucket = "projet-esteem",
+  opts = list(region = "")
+)
+
+cat("Dimensions :", nrow(ressources_eau), "lignes |",
+    ncol(ressources_eau), "colonnes\n")
+cat("Colonnes :", names(ressources_eau), "\n")
+head(ressources_eau, 5)
+```
+```{r ind04-merge-intensite-eau}
+# Objectif : fusionner conso EXIOBASE avec ressources en eau
+# conversion ressources_mm3 en numérique avant le calcul
+
+intensite_eau_ind04 <- conso_totale_ind04 %>%
+  filter(annee %in% 2014:2022) %>%
+  inner_join(
+    ressources_eau %>% mutate(ressources_mm3 = as.numeric(ressources_mm3)),
+    by = c("pays", "annee")
+  ) %>%
+  mutate(
+    intensite_pct = round(conso_totale_m3 / ressources_mm3 * 100, 3)
+  ) %>%
+  arrange(pays, annee)
+
+cat("Pays dans le merge  :", n_distinct(intensite_eau_ind04$pays), "\n")
+cat("Années disponibles  :", paste(range(intensite_eau_ind04$annee), collapse = " - "), "\n")
+cat("Lignes totales      :", nrow(intensite_eau_ind04), "\n\n")
+
+print(intensite_eau_ind04 %>%
+  select(pays, annee, conso_totale_m3, ressources_mm3, intensite_pct), n = Inf)
+```
+
+```{r ind04-stats-intensite-eau}
+# Objectif : stats descriptives de l'intensité par pays
+# moyenne, min, max sur la période disponible
+
+stats_intensite_eau <- intensite_eau_ind04 %>%
+  group_by(pays) %>%
+  summarise(
+    intensite_moy = round(mean(intensite_pct, na.rm = TRUE), 3),
+    intensite_min = round(min(intensite_pct,  na.rm = TRUE), 3),
+    intensite_max = round(max(intensite_pct,  na.rm = TRUE), 3),
+    n_annees      = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(intensite_moy))
+
+cat("=== Classement pays par intensité moy. (%) ===\n")
+cat("Seuil stress hydrique Arkaitz : 20%\n\n")
+print(stats_intensite_eau, n = Inf)
+
+```
+
+```{r ind04-stats-intensite-eau}
+# stats par pays : moy, min, max sur 2014-2022
+# seuil de référence Arkaitz : 20%
+
+stats_intensite_eau <- intensite_eau_ind04 %>%
+  group_by(pays) %>%
+  summarise(
+    intensite_moy = round(mean(intensite_pct, na.rm = TRUE), 3),
+    intensite_min = round(min(intensite_pct,  na.rm = TRUE), 3),
+    intensite_max = round(max(intensite_pct,  na.rm = TRUE), 3),
+    n_annees      = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    statut = case_when(
+      intensite_moy >= 20 ~ "Stress hydrique",
+      intensite_moy >= 10 ~ "Proche du seuil",
+      TRUE                ~ "Pas de stress"
+    )
+  ) %>%
+  arrange(desc(intensite_moy))
+
+cat("=== Classement intensité utilisation eau bleue (%) ===\n")
+cat("Seuil stress hydrique : 20% | Proche seuil : 10-20%\n\n")
+print(stats_intensite_eau, n = Inf)
+
+```
+```{r ind04-stats-intensite-variation}
+# Objectif : ajouter variation 2015→2022 et tendance au tableau
+
+library(tidyr)
+
+variation_intensite <- intensite_eau_ind04 %>%
+  filter(annee %in% c(2015, 2022)) %>%
+  select(pays, annee, intensite_pct) %>%
+  pivot_wider(
+    names_from   = annee,
+    values_from  = intensite_pct,
+    names_prefix = "int_"
+  ) %>%
+  filter(!is.na(int_2015) & !is.na(int_2022)) %>%
+  mutate(
+    variation_pct = round((int_2022 - int_2015) / int_2015 * 100, 1),
+    tendance      = case_when(
+      variation_pct >  5  ~ "Hausse",
+      variation_pct < -5  ~ "Baisse",
+      TRUE                ~ "Stable"
+    )
+  ) %>%
+  select(pays, int_2015, int_2022, variation_pct, tendance)
+
+# jointure avec stats existantes
+stats_intensite_eau <- stats_intensite_eau %>%
+  left_join(variation_intensite, by = "pays")
+
+cat("=== Classement intensité utilisation eau bleue (%) + variation 2015→2022 ===\n")
+cat("Seuil stress hydrique : 20% | Proche seuil : 10-20%\n\n")
+print(stats_intensite_eau, n = Inf)
+```
+```{r ind04-conso-cumulee-totale}
+# Objectif : consommation totale cumulée par pays sur toute la période 1995-2022
+# tous secteurs agrégés
+
+conso_cumulee_totale <- conso_totale_ind04 %>%
+  group_by(pays) %>%
+  summarise(
+    conso_cumulee_mm3 = round(sum(conso_totale_m3, na.rm = TRUE), 1),
+    n_annees          = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(conso_cumulee_mm3)) %>%
+  mutate(rang = row_number())
+
+cat("=== Classement pays par consommation cumulée 1995-2022 (Mm³) ===\n")
+print(conso_cumulee_totale, n = Inf)
+```
+```{r ind04-graph-barres-classement}
+# Objectif : barres horizontales classées par consommation cumulée totale
+# simple et lisible — montre la domination de ES
+
+p_barres <- ggplot(
+    conso_cumulee_totale,
+    aes(x = reorder(pays, conso_cumulee_mm3),
+        y = conso_cumulee_mm3)
+  ) +
+  geom_col(fill = "#4575B4", alpha = 0.85) +
+  geom_text(aes(label = round(conso_cumulee_mm3, 0)),
+            hjust = -0.1, size = 3, fontface = "bold") +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title    = "Ind. 04 — Consommation eau bleue cumulée par pays (1995–2022)",
+    subtitle = "Tous secteurs agrégés (Agriculture + Électricité + Manufacturing) | Source : EXIOBASE v3.10.2 | Unité : Mm³",
+    x        = NULL,
+    y        = "Consommation cumulée (Mm³)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    panel.grid.minor = element_blank(),
+    axis.text.y      = element_text(face = "bold")
+  )
+
+ggsave("Ind04_barres_conso_cumulee_27pays.png",
+       plot = p_barres, width = 12, height = 9, dpi = 300)
+p_barres
+```
+
+```{r ind04-graph-barres-empilees-secteur}
+# Objectif : barres empilées par secteur classées par total décroissant
+# montre volume ET structure sectorielle simultanément
+
+# ordre des pays par consommation totale décroissante
+ordre_pays <- conso_cumulee_totale %>% pull(pays)
+
+# données cumulées par secteur
+conso_cumulee_secteur <- conso_secteur %>%
+  group_by(pays, secteur) %>%
+  summarise(
+    conso_cumulee_mm3 = round(sum(conso_m3, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+
+p_empile <- ggplot(
+    conso_cumulee_secteur,
+    aes(x    = factor(pays, levels = rev(ordre_pays)),
+        y    = conso_cumulee_mm3,
+        fill = secteur)
+  ) +
+  geom_col() +
+  scale_fill_manual(
+    values = c(
+      "Agriculture"   = "#1A9850",
+      "Electricite"   = "#4575B4",
+      "Manufacturing" = "#FDAE61"
+    ),
+    name = "Secteur"
+  ) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    title    = "Ind. 04 — Consommation eau bleue cumulée par pays et par secteur (1995–2022)",
+    subtitle = "Agriculture (vert) | Électricité (bleu) | Manufacturing (orange) | Source : EXIOBASE v3.10.2 | Unité : Mm³",
+    x        = NULL,
+    y        = "Consommation cumulée (Mm³)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    panel.grid.minor = element_blank(),
+    axis.text.y      = element_text(face = "bold"),
+    legend.position  = "bottom"
+  )
+
+ggsave("Ind04_barres_empilees_secteur_27pays.png",
+       plot = p_empile, width = 12, height = 9, dpi = 300)
+p_empile
+```
+```{r ind04-graph-barres-classement}
+# Objectif : barres horizontales classées par consommation cumulée totale
+# 1995-2022 tous secteurs agrégés
+
+p_barres <- ggplot(
+    conso_cumulee_totale,
+    aes(x = reorder(pays, conso_cumulee_mm3),
+        y = conso_cumulee_mm3)
+  ) +
+  geom_col(fill = "#4575B4", alpha = 0.85) +
+  geom_text(aes(label = round(conso_cumulee_mm3, 0)),
+            hjust = -0.1, size = 3, fontface = "bold") +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title    = "Ind. 04 — Consommation eau bleue cumulée par pays (1995–2022)",
+    subtitle = "Tous secteurs agrégés (Agriculture + Électricité + Manufacturing) | Source : EXIOBASE v3.10.2 | Unité : Mm³",
+    x        = NULL,
+    y        = "Consommation cumulée (Mm³)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "black"),
+    panel.grid.minor = element_blank(),
+    axis.text.y      = element_text(face = "bold")
+  )
+
+ggsave("Ind04_barres_conso_cumulee_27pays.png",
+       plot = p_barres, width = 12, height = 9, dpi = 300)
+p_barres
 ```
